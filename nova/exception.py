@@ -587,14 +587,6 @@ class VolumeBDMPathNotFound(VolumeBDMNotFound):
     msg_fmt = _("No volume Block Device Mapping at path: %(path)s")
 
 
-class DeviceDetachFailed(NovaException):
-    msg_fmt = _("Device detach failed for %(device)s: %(reason)s)")
-
-
-class DeviceNotFound(NotFound):
-    msg_fmt = _("Device '%(device)s' not found.")
-
-
 class SnapshotNotFound(NotFound):
     ec2_code = 'InvalidSnapshot.NotFound'
     msg_fmt = _("Snapshot %(snapshot_id)s could not be found.")
@@ -1121,7 +1113,7 @@ class FlavorAccessNotFound(NotFound):
 
 
 class FlavorExtraSpecUpdateCreateFailed(NovaException):
-    msg_fmt = _("Flavor %(id)s extra spec cannot be updated or created "
+    msg_fmt = _("Flavor %(id)d extra spec cannot be updated or created "
                 "after %(retries)d retries.")
 
 
@@ -1390,6 +1382,18 @@ class FlavorCreateFailed(NovaException):
 
 class InstancePasswordSetFailed(NovaException):
     msg_fmt = _("Failed to set admin password on %(instance)s "
+                "because %(reason)s")
+    safe = True
+
+
+class InstanceVcpusSetFailed(NovaException):
+    msg_fmt = _("Failed to set vcpus on %(instance)s "
+                "because %(reason)s")
+    safe = True
+
+
+class InstanceMemSetFailed(NovaException):
+    msg_fmt = _("Failed to set mem on %(instance)s "
                 "because %(reason)s")
     safe = True
 
@@ -1870,6 +1874,14 @@ class QemuGuestAgentNotEnabled(Invalid):
 
 class SetAdminPasswdNotSupported(Invalid):
     msg_fmt = _('Set admin password is not supported')
+
+
+class SetVcpusNotSupported(Invalid):
+    msg_fmt = _('Set vcpus is not supported')
+
+
+class SetMemNotSupported(Invalid):
+    msg_fmt = _('Set mem is not supported')
 
 
 class MemoryPageSizeInvalid(Invalid):

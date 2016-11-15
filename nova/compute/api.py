@@ -937,13 +937,7 @@ class API(base.Base):
                 block_device.properties_root_device_name(
                     boot_meta.get('properties', {})))
 
-        try:
-            image_meta = objects.ImageMeta.from_dict(boot_meta)
-        except ValueError as e:
-            # there must be invalid values in the image meta properties so
-            # consider this an invalid request
-            msg = _('Invalid image metadata. Error: %s') % six.text_type(e)
-            raise exception.InvalidRequest(msg)
+        image_meta = objects.ImageMeta.from_dict(boot_meta)
         numa_topology = hardware.numa_get_constraints(
                 instance_type, image_meta)
 
@@ -2900,6 +2894,48 @@ class API(base.Base):
                                                new_pass=password)
 
     @wrap_check_policy
+    @check_instance_lock
+    @check_instance_cell
+    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
+                                    vm_states.STOPPED])
+    def set_vcpus(self, context, instance, vcpus=None):
+        """Set the vcpu num for the given instance.
+
+        @param context: Nova auth context.
+        @param instance: Nova instance object.
+        @param vcpus: The amount of vcpus for the instance.
+        """
+        instance.task_state = task_states.UPDATING_VCPUS
+        instance.save(expected_task_state=[None])
+        self._record_action_start(context, instance,
+                                  instance_actions.CHANGE_VCPUS)
+
+        self.compute_rpcapi.set_vcpus(context,
+                                      instance=instance,
+                                      new_vcpus=vcpus)
+
+    @wrap_check_policy
+    @check_instance_lock
+    @check_instance_cell
+    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
+                                    vm_states.STOPPED])
+    def set_mem(self, context, instance, mem=None):
+        """Set the memory amount for the given instance.
+
+        @param context: Nova auth context.
+        @param instance: Nova instance object.
+        @param mem: The amount of memory for the instance.
+        """
+        instance.task_state = task_states.UPDATING_MEM
+        instance.save(expected_task_state=[None])
+        self._record_action_start(context, instance,
+                                  instance_actions.CHANGE_MEM)
+
+        self.compute_rpcapi.set_mem(context,
+                                    instance=instance,
+                                    new_mem=mem)
+
+    @wrap_check_policy
     @check_instance_host
     def get_vnc_console(self, context, instance, console_type):
         """Get a url to an instance Console."""
@@ -3277,12 +3313,13 @@ class API(base.Base):
         return bdms.root_bdm()
 
     def is_volume_backed_instance(self, context, instance, bdms=None):
+        if not instance.image_ref:
+            return True
+
         root_bdm = self._get_root_bdm(context, instance, bdms)
-        if root_bdm is not None:
-            return root_bdm.is_volume
-        # in case we hit a very old instance without root bdm, we _assume_ that
-        # instance is backed by a volume, if and only if image_ref is not set
-        return not instance.image_ref
+        if not root_bdm:
+            return False
+        return root_bdm.is_volume
 
     @check_instance_lock
     @check_instance_cell

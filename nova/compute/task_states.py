@@ -41,6 +41,12 @@ IMAGE_BACKUP = 'image_backup'
 # possible task states during set_admin_password()
 UPDATING_PASSWORD = 'updating_password'
 
+# possible task states during set_vcpus()
+UPDATING_VCPUS = 'updating_vcpus'
+
+# possible task states during set_mem()
+UPDATING_MEM = 'updating_mem'
+
 # possible task states during resize()
 RESIZE_PREP = 'resize_prep'
 RESIZE_MIGRATING = 'resize_migrating'

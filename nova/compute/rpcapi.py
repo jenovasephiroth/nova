@@ -547,7 +547,6 @@ class ComputeAPI(object):
         version = '4.2'
         if not self.client.can_send_version(version):
             version = '4.0'
-            args.pop('migration')
         cctxt = self.client.prepare(server=host, version=version)
         cctxt.cast(ctxt, 'live_migration', instance=instance,
                    dest=dest, block_migration=block_migration,
@@ -733,6 +732,20 @@ class ComputeAPI(object):
                 version=version)
         return cctxt.call(ctxt, 'set_admin_password',
                           instance=instance, new_pass=new_pass)
+
+    def set_vcpus(self, ctxt, instance, new_vcpus):
+        version = '4.0'
+        cctxt = self.client.prepare(server=_compute_host(None, instance),
+                version=version)
+        return cctxt.call(ctxt, 'set_vcpus',
+                          instance=instance, new_vcpus=new_vcpus)
+
+    def set_mem(self, ctxt, instance, new_mem):
+        version = '4.0'
+        cctxt = self.client.prepare(server=_compute_host(None, instance),
+                version=version)
+        return cctxt.call(ctxt, 'set_mem',
+                          instance=instance, new_mem=new_mem)
 
     def set_host_enabled(self, ctxt, enabled, host):
         version = '4.0'

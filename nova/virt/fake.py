@@ -203,6 +203,12 @@ class FakeDriver(driver.ComputeDriver):
     def set_admin_password(self, instance, new_pass):
         pass
 
+    def set_vcpus(self, instance, new_vcpus):
+        pass
+
+    def set_mem(self, instance, new_mem):
+        pass
+
     def inject_file(self, instance, b64_path, b64_contents):
         pass
 

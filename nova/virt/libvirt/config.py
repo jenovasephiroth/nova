@@ -1822,6 +1822,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self.memtune = None
         self.numatune = None
         self.vcpus = 1
+        self.vcpus_max = None
         self.cpuset = None
         self.cpu = None
         self.cputune = None
@@ -1853,12 +1854,14 @@ class LibvirtConfigGuest(LibvirtConfigObject):
             root.append(self.memtune.format_dom())
         if self.numatune is not None:
             root.append(self.numatune.format_dom())
-        if self.cpuset is not None:
-            vcpu = self._text_node("vcpu", self.vcpus)
-            vcpu.set("cpuset", hardware.format_cpu_spec(self.cpuset))
-            root.append(vcpu)
+        if self.vcpus_max is not None:
+            vcpu = self._text_node("vcpu", self.vcpus_max)
+            vcpu.set("current", str(self.vcpus))
         else:
-            root.append(self._text_node("vcpu", self.vcpus))
+            vcpu = self._text_node("vcpu", self.vcpus)
+        if self.cpuset is not None:
+            vcpu.set("cpuset", hardware.format_cpu_spec(self.cpuset))
+        root.append(vcpu)
 
         if len(self.metadata) > 0:
             metadata = etree.Element("metadata")

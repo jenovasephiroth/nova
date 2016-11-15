@@ -568,7 +568,8 @@ def _get_desirable_cpu_topologies(flavor, image_meta, allow_threads=True,
     LOG.debug("Topology preferred %(preferred)s, maximum %(maximum)s",
               {"preferred": preferred, "maximum": maximum})
 
-    possible = _get_possible_cpu_topologies(flavor.vcpus,
+    vcpus = flavor.extra_specs.get('cpu:max', '') or flavor.vcpus
+    possible = _get_possible_cpu_topologies(int(vcpus),
                                             maximum,
                                             allow_threads)
     LOG.debug("Possible topologies %s", possible)

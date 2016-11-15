@@ -91,7 +91,6 @@ from nova.virt import driver
 from nova.virt import firewall
 from nova.virt import hardware
 from nova.virt.image import model as imgmodel
-from nova.virt import images
 from nova.virt.libvirt import blockinfo
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import firewall as libvirt_firewall
@@ -419,6 +418,12 @@ MIN_LIBVIRT_PARALLELS_VERSION = (1, 2, 12)
 
 # Ability to set the user guest password with Qemu
 MIN_LIBVIRT_SET_ADMIN_PASSWD = (1, 2, 16)
+
+# Ability to set the vcpus with Qemu
+MIN_LIBVIRT_SET_VCPUS = (1, 1, 0)
+
+# Ability to set the memory with Qemu
+MIN_LIBVIRT_SET_MEM = (1, 1, 0)
 
 # s/390 & s/390x architectures with KVM
 MIN_LIBVIRT_KVM_S390_VERSION = (1, 2, 13)
@@ -1030,18 +1035,6 @@ class LibvirtDriver(driver.ComputeDriver):
             utils.execute('rm', '-rf', target, delay_on_retry=True,
                           attempts=5)
 
-        backend = self.image_backend.image(instance, 'disk')
-        # TODO(nic): Set ignore_errors=False in a future release.
-        # It is set to True here to avoid any upgrade issues surrounding
-        # instances being in pending resize state when the software is updated;
-        # in that case there will be no snapshot to remove.  Once it can be
-        # reasonably assumed that no such instances exist in the wild
-        # anymore, it should be set back to False (the default) so it will
-        # throw errors, like it should.
-        if backend.check_image_exists():
-            backend.remove_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME,
-                                ignore_errors=True)
-
         if instance.host != CONF.host:
             self._undefine_domain(instance)
             self.unplug_vifs(instance, network_info)
@@ -1224,14 +1217,13 @@ class LibvirtDriver(driver.ComputeDriver):
         disk_dev = mountpoint.rpartition("/")[2]
         try:
             guest = self._host.get_guest(instance)
+            conf = guest.get_disk(disk_dev)
+            if not conf:
+                raise exception.DiskNotFound(location=disk_dev)
 
             state = guest.get_power_state(self._host)
             live = state in (power_state.RUNNING, power_state.PAUSED)
-
-            wait_for_detach = guest.detach_device_with_retry(guest.get_disk,
-                                                             disk_dev,
-                                                             persistent=True,
-                                                             live=live)
+            guest.detach_device(conf, persistent=True, live=live)
 
             if encryption:
                 # The volume must be detached from the VM before
@@ -1240,16 +1232,12 @@ class LibvirtDriver(driver.ComputeDriver):
                 encryptor = self._get_volume_encryptor(connection_info,
                                                        encryption)
                 encryptor.detach_volume(**encryption)
-
-            wait_for_detach()
         except exception.InstanceNotFound:
             # NOTE(zhaoqin): If the instance does not exist, _lookup_by_name()
             #                will throw InstanceNotFound exception. Need to
             #                disconnect volume under this circumstance.
             LOG.warn(_LW("During detach_volume, instance disappeared."),
                      instance=instance)
-        except exception.DeviceNotFound:
-            raise exception.DiskNotFound(location=disk_dev)
         except libvirt.libvirtError as ex:
             # NOTE(vish): This is called to cleanup volumes after live
             #             migration, so we should still disconnect even if
@@ -1356,23 +1344,10 @@ class LibvirtDriver(driver.ComputeDriver):
 
         snapshot = self._image_api.get(context, image_id)
 
-        # source_format is an on-disk format
-        # source_type is a backend type
-        disk_path, source_format = libvirt_utils.find_disk(virt_dom)
-        source_type = libvirt_utils.get_disk_type_from_path(disk_path)
+        disk_path = libvirt_utils.find_disk(virt_dom)
+        source_format = libvirt_utils.get_disk_type(disk_path)
 
-        # We won't have source_type for raw or qcow2 disks, because we can't
-        # determine that from the path. We should have it from the libvirt
-        # xml, though.
-        if source_type is None:
-            source_type = source_format
-        # For lxc instances we won't have it either from libvirt xml
-        # (because we just gave libvirt the mounted filesystem), or the path,
-        # so source_type is still going to be None. In this case,
-        # snapshot_backend is going to default to CONF.libvirt.images_type
-        # below, which is still safe.
-
-        image_format = CONF.libvirt.snapshot_image_format or source_type
+        image_format = CONF.libvirt.snapshot_image_format or source_format
 
         # NOTE(bfilippov): save lvm and rbd as raw
         if image_format == 'lvm' or image_format == 'rbd':
@@ -1398,7 +1373,7 @@ class LibvirtDriver(driver.ComputeDriver):
         if (self._host.has_min_version(MIN_LIBVIRT_LIVESNAPSHOT_VERSION,
                                        MIN_QEMU_LIVESNAPSHOT_VERSION,
                                        host.HV_DRIVER_QEMU)
-             and source_type not in ('lvm', 'rbd')
+             and source_format not in ('lvm', 'rbd')
              and not CONF.ephemeral_storage_encryption.enabled
              and not CONF.workarounds.disable_libvirt_livesnapshot):
             live_snapshot = True
@@ -1433,7 +1408,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
         snapshot_backend = self.image_backend.snapshot(instance,
                 disk_path,
-                image_type=source_type)
+                image_type=source_format)
 
         if live_snapshot:
             LOG.info(_LI("Beginning live snapshot process"),
@@ -1452,8 +1427,7 @@ class LibvirtDriver(driver.ComputeDriver):
                     # NOTE(xqueralt): libvirt needs o+x in the temp directory
                     os.chmod(tmpdir, 0o701)
                     self._live_snapshot(context, instance, guest, disk_path,
-                                        out_path, source_format, image_format,
-                                        image_meta)
+                                        out_path, image_format, image_meta)
                 else:
                     snapshot_backend.snapshot_extract(out_path, image_format)
             finally:
@@ -1515,6 +1489,63 @@ class LibvirtDriver(driver.ComputeDriver):
                    % {'user': user, 'error_code': error_code, 'ex': ex})
             raise exception.NovaException(msg)
 
+    def _can_set_vcpus(self, image_meta):
+        if (CONF.libvirt.virt_type not in ('kvm', 'qemu') or
+            not self._host.has_min_version(MIN_LIBVIRT_SET_VCPUS)):
+            raise exception.SetVcpusNotSupported()
+
+        hw_qga = image_meta.properties.get('hw_qemu_guest_agent', '')
+        if not strutils.bool_from_string(hw_qga):
+            raise exception.QemuGuestAgentNotEnabled()
+
+    def set_vcpus(self, instance, new_vcpus):
+        image_meta = objects.ImageMeta.from_instance(instance)
+        self._can_set_vcpus(image_meta)
+
+        guest = self._host.get_guest(instance)
+        try:
+            state = guest.get_power_state(self._host)
+            live = state in (power_state.RUNNING, power_state.PAUSED)
+            current = state in (power_state.SHUTDOWN,)
+            modify_cpu_state = live and (int(new_vcpus) > int(instance.vcpus))
+            # Note: Options --guest and --config are mutually exclusive
+            guest.set_vcpus(new_vcpus, persistent=False, live=live,
+                            modify_cpu_state=modify_cpu_state,
+                            current=current)
+            guest.set_vcpus(new_vcpus, persistent=True)
+        except libvirt.libvirtError as ex:
+            error_code = ex.get_error_code()
+            msg = (_('Error from libvirt while setting vcpus for '
+                     '%(instance_name)s: [Error Code %(error_code)s] %(ex)s')
+                   % {'instance_name': instance.name,
+                      'error_code': error_code, 'ex': ex})
+            raise exception.NovaException(msg)
+
+    def _can_set_mem(self, image_meta):
+        if (CONF.libvirt.virt_type not in ('kvm', 'qemu') or
+            not self._host.has_min_version(MIN_LIBVIRT_SET_MEM)):
+            raise exception.SetMemNotSupported()
+
+    def set_mem(self, instance, new_mem):
+        image_meta = objects.ImageMeta.from_instance(instance)
+        self._can_set_mem(image_meta)
+
+        guest = self._host.get_guest(instance)
+        try:
+            state = guest.get_power_state(self._host)
+            live = state in (power_state.RUNNING, power_state.PAUSED)
+            current = state in (power_state.SHUTDOWN,)
+            guest.set_mem(new_mem*1024, persistent=False, live=live,
+                          current=current)
+            guest.set_mem(new_mem*1024, persistent=True)
+        except libvirt.libvirtError as ex:
+            error_code = ex.get_error_code()
+            msg = (_('Error from libvirt while setting mem for '
+                     '%(instance_name)s: [Error Code %(error_code)s] %(ex)s')
+                   % {'instance_name': instance.name,
+                      'error_code': error_code, 'ex': ex})
+            raise exception.NovaException(msg)
+
     def _can_quiesce(self, instance, image_meta):
         if (CONF.libvirt.virt_type not in ('kvm', 'qemu') or
             not self._host.has_min_version(MIN_LIBVIRT_FSFREEZE_VERSION)):
@@ -1559,7 +1590,7 @@ class LibvirtDriver(driver.ComputeDriver):
         self._set_quiesced(context, instance, image_meta, False)
 
     def _live_snapshot(self, context, instance, guest, disk_path, out_path,
-                       source_format, image_format, image_meta):
+                       image_format, image_meta):
         """Snapshot an instance without downtime."""
         dev = guest.get_block_device(disk_path)
 
@@ -1577,11 +1608,9 @@ class LibvirtDriver(driver.ComputeDriver):
         #             in QEMU 1.3. In order to do this, we need to create
         #             a destination image with the original backing file
         #             and matching size of the instance root disk.
-        src_disk_size = libvirt_utils.get_disk_size(disk_path,
-                                                    format=source_format)
+        src_disk_size = libvirt_utils.get_disk_size(disk_path)
         src_back_path = libvirt_utils.get_disk_backing_file(disk_path,
-                                                        format=source_format,
-                                                        basename=False)
+                                                            basename=False)
         disk_delta = out_path + '.delta'
         libvirt_utils.create_cow_image(src_back_path, disk_delta,
                                        src_disk_size)
@@ -1832,51 +1861,6 @@ class LibvirtDriver(driver.ComputeDriver):
         timer = loopingcall.FixedIntervalLoopingCall(_wait_for_snapshot)
         timer.start(interval=0.5).wait()
 
-    @staticmethod
-    def _rebase_with_qemu_img(guest, device, active_disk_object,
-                              rebase_base):
-        """Rebase a device tied to a guest using qemu-img.
-
-        :param guest:the Guest which owns the device being rebased
-        :type guest: nova.virt.libvirt.guest.Guest
-        :param device: the guest block device to rebase
-        :type device: nova.virt.libvirt.guest.BlockDevice
-        :param active_disk_object: the guest block device to rebase
-        :type active_disk_object: nova.virt.libvirt.config.\
-                                    LibvirtConfigGuestDisk
-        :param rebase_base: the new parent in the backing chain
-        :type rebase_base: None or string
-        """
-
-        # It's unsure how well qemu-img handles network disks for
-        # every protocol. So let's be safe.
-        active_protocol = active_disk_object.source_protocol
-        if active_protocol is not None:
-            msg = _("Something went wrong when deleting a volume snapshot: "
-                    "rebasing a %(protocol)s network disk using qemu-img "
-                    "has not been fully tested") % {'protocol':
-                    active_protocol}
-            LOG.error(msg)
-            raise exception.NovaException(msg)
-
-        if rebase_base is None:
-            # If backing_file is specified as "" (the empty string), then
-            # the image is rebased onto no backing file (i.e. it will exist
-            # independently of any backing file).
-            backing_file = ""
-            qemu_img_extra_arg = []
-        else:
-            # If the rebased image is going to have a backing file then
-            # explicitly set the backing file format to avoid any security
-            # concerns related to file format auto detection.
-            backing_file = rebase_base
-            b_file_fmt = images.qemu_img_info(backing_file).file_format
-            qemu_img_extra_arg = ['-F', b_file_fmt]
-
-        qemu_img_extra_arg.append(active_disk_object.source_path)
-        utils.execute("qemu-img", "rebase", "-b", backing_file,
-                      *qemu_img_extra_arg)
-
     def _volume_snapshot_delete(self, context, instance, volume_id,
                                 snapshot_id, delete_info=None):
         """Note:
@@ -2030,24 +2014,15 @@ class LibvirtDriver(driver.ComputeDriver):
                  'relative': str(relative)}, instance=instance)
 
             dev = guest.get_block_device(rebase_disk)
-            if guest.is_active():
-                result = dev.rebase(rebase_base, relative=relative)
-                if result == 0:
-                    LOG.debug('blockRebase started successfully',
-                              instance=instance)
+            result = dev.rebase(rebase_base, relative=relative)
+            if result == 0:
+                LOG.debug('blockRebase started successfully',
+                          instance=instance)
 
-                while dev.wait_for_job(abort_on_error=True):
-                    LOG.debug('waiting for blockRebase job completion',
-                              instance=instance)
-                    time.sleep(0.5)
-
-            # If the guest is not running libvirt won't do a blockRebase.
-            # In that case, let's ask qemu-img to rebase the disk.
-            else:
-                LOG.debug('Guest is not running so doing a block rebase '
-                          'using "qemu-img rebase"', instance=instance)
-                self._rebase_with_qemu_img(guest, dev, active_disk_object,
-                                           rebase_base)
+            while dev.wait_for_job(abort_on_error=True):
+                LOG.debug('waiting for blockRebase job completion',
+                          instance=instance)
+                time.sleep(0.5)
 
         else:
             # commit with blockCommit()
@@ -2488,9 +2463,7 @@ class LibvirtDriver(driver.ComputeDriver):
         """
         instance_dir = libvirt_utils.get_instance_path(instance)
         unrescue_xml_path = os.path.join(instance_dir, 'unrescue.xml')
-        xml_path = os.path.join(instance_dir, 'libvirt.xml')
         xml = libvirt_utils.load_file(unrescue_xml_path)
-        libvirt_utils.write_to_file(xml_path, xml)
         guest = self._host.get_guest(instance)
 
         # TODO(sahid): We are converting all calls from a
@@ -2781,14 +2754,17 @@ class LibvirtDriver(driver.ComputeDriver):
             libvirt_utils.chown(disk_config, os.getuid())
 
     @staticmethod
-    def _is_booted_from_volume(instance, disk_mapping):
+    def _is_booted_from_volume(instance):
         """Determines whether the VM is booting from volume
 
         Determines whether the disk mapping indicates that the VM
         is booting from a volume.
         """
-        return ((not bool(instance.get('image_ref')))
-                or 'disk' not in disk_mapping)
+        context = nova_context.get_admin_context()
+        bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                context, instance.uuid)
+        return (bdms and any(bdm.is_volume and bdm.is_root
+                for bdm in bdms))
 
     @staticmethod
     def _has_local_disk(instance, disk_mapping):
@@ -2877,7 +2853,7 @@ class LibvirtDriver(driver.ComputeDriver):
                       admin_pass=None, inject_files=True,
                       fallback_from_host=None):
         booted_from_volume = self._is_booted_from_volume(
-            instance, disk_mapping)
+            instance)
 
         def image(fname, image_type=CONF.libvirt.images_type):
             return self.image_backend.image(instance,
@@ -2937,8 +2913,6 @@ class LibvirtDriver(driver.ComputeDriver):
                 size = None
 
             backend = image('disk')
-            if instance.task_state == task_states.RESIZE_FINISH:
-                backend.create_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME)
             if backend.SUPPORTS_CLONE:
                 def clone_fallback_to_fetch(*args, **kwargs):
                     try:
@@ -3119,7 +3093,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 for hdev in [d for d in guest_config.devices
                     if isinstance(d, vconfig.LibvirtConfigGuestHostdevPCI)]:
                     hdbsf = [hdev.domain, hdev.bus, hdev.slot, hdev.function]
-                    dbsf = pci_utils.parse_address(dev.address)
+                    dbsf = pci_utils.parse_address(dev['address'])
                     if [int(x, 16) for x in hdbsf] ==\
                             [int(x, 16) for x in dbsf]:
                         raise exception.PciDeviceDetachFailed(reason=
@@ -3322,15 +3296,6 @@ class LibvirtDriver(driver.ComputeDriver):
         image = self.image_backend.image(instance,
                                          name,
                                          image_type)
-        if (name == 'disk.config' and image_type == 'rbd' and
-                not image.check_image_exists()):
-            # This is likely an older config drive that has not been migrated
-            # to rbd yet. Try to fall back on 'raw' image type.
-            # TODO(melwitt): Add online migration of some sort so we can
-            # remove this fall back once we know all config drives are in rbd.
-            image = self.image_backend.image(instance, name, 'raw')
-            LOG.debug('Config drive not found in RBD, falling back to the '
-                      'instance directory', instance=instance)
         disk_info = disk_mapping[name]
         return image.libvirt_info(disk_info['bus'],
                                   disk_info['dev'],
@@ -4227,7 +4192,8 @@ class LibvirtDriver(driver.ComputeDriver):
         guest.uuid = instance.uuid
         # We are using default unit for memory: KiB
         guest.memory = flavor.memory_mb * units.Ki
-        guest.vcpus = flavor.vcpus
+        guest.vcpus = instance.vcpus
+        guest.vcpus_max = flavor.extra_specs.get('cpu:max', '')
         allowed_cpus = hardware.get_vcpu_pin_set()
         pci_devs = pci_manager.get_instance_pci_devs(instance, 'all')
 
@@ -4354,8 +4320,7 @@ class LibvirtDriver(driver.ComputeDriver):
                          '"hw:watchdog_action" instead'), instance=instance)
         # TODO(pkholkin): accepting old property name 'hw_watchdog_action'
         #                should be removed in the next release
-        watchdog_action = (flavor.extra_specs.get('hw_watchdog_action') or
-                           flavor.extra_specs.get('hw:watchdog_action')
+        watchdog_action = (flavor.extra_specs.get('hw_watchdog_action')
                            or 'disabled')
         watchdog_action = image_meta.properties.get('hw_watchdog_action',
                                                     watchdog_action)
@@ -4455,7 +4420,7 @@ class LibvirtDriver(driver.ComputeDriver):
         disk_info = disk_info or {}
         disk_mapping = disk_info.get('mapping', {})
 
-        if self._is_booted_from_volume(instance, disk_mapping):
+        if self._is_booted_from_volume(instance):
             block_device_mapping = driver.block_device_info_get_mapping(
                                                             block_device_info)
             root_disk = block_device.get_root_bdm(block_device_mapping)
@@ -5258,8 +5223,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
         disk_info_text = self.get_instance_disk_info(
             instance, block_device_info=block_device_info)
-        booted_from_volume = self._is_booted_from_volume(instance,
-                                                         disk_info_text)
+        booted_from_volume = self._is_booted_from_volume(instance)
         has_local_disk = self._has_local_disk(instance, disk_info_text)
 
         if dest_check_data['block_migration']:
@@ -5399,13 +5363,8 @@ class LibvirtDriver(driver.ComputeDriver):
             raise exception.
         """
 
-        # NOTE(kchamart): Comparing host to guest CPU model for emulated
-        # guests (<domain type='qemu'>) should not matter -- in this
-        # mode (QEMU "TCG") the CPU is fully emulated in software and no
-        # hardware acceleration, like KVM, is involved. So, skip the CPU
-        # compatibility check for the QEMU domain type, and retain it for
-        # KVM guests.
-        if CONF.libvirt.virt_type not in ['kvm']:
+        # NOTE(berendt): virConnectCompareCPU not working for Xen
+        if CONF.libvirt.virt_type not in ['qemu', 'kvm']:
             return
 
         if guest_cpu is None:
@@ -6296,24 +6255,6 @@ class LibvirtDriver(driver.ComputeDriver):
                       instance=instance)
             os.mkdir(instance_dir)
 
-            # Recreate the disk.info file and in doing so stop the
-            # imagebackend from recreating it incorrectly by inspecting the
-            # contents of each file when using the Raw backend.
-            if disk_info:
-                image_disk_info = {}
-                for info in disk_info:
-                    image_file = os.path.basename(info['path'])
-                    image_path = os.path.join(instance_dir, image_file)
-                    image_disk_info[image_path] = info['type']
-
-                LOG.debug('Creating disk.info with the contents: %s',
-                          image_disk_info, instance=instance)
-
-                image_disk_info_path = os.path.join(instance_dir,
-                                                    'disk.info')
-                libvirt_utils.write_to_file(image_disk_info_path,
-                                            jsonutils.dumps(image_disk_info))
-
             if not is_shared_block_storage:
                 # Ensure images and backing files are present.
                 LOG.debug('Checking to make sure images and backing files are '
@@ -6780,8 +6721,7 @@ class LibvirtDriver(driver.ComputeDriver):
         ephemeral_down = flavor.ephemeral_gb < eph_size
         disk_info_text = self.get_instance_disk_info(
             instance, block_device_info=block_device_info)
-        booted_from_volume = self._is_booted_from_volume(instance,
-                                                         disk_info_text)
+        booted_from_volume = self._is_booted_from_volume(instance)
         if (root_down and not booted_from_volume) or ephemeral_down:
             reason = _("Unable to resize disk down.")
             raise exception.InstanceFaultRollback(
@@ -6831,11 +6771,6 @@ class LibvirtDriver(driver.ComputeDriver):
                 dest = None
                 utils.execute('mkdir', '-p', inst_base)
 
-            on_execute = lambda process: \
-                self.job_tracker.add_job(instance, process.pid)
-            on_completion = lambda process: \
-                self.job_tracker.remove_job(instance, process.pid)
-
             active_flavor = instance.get_flavor()
             for info in disk_info:
                 # assume inst_base == dirname(info['path'])
@@ -6854,21 +6789,15 @@ class LibvirtDriver(driver.ComputeDriver):
                 if not (fname == 'disk.swap' and
                     active_flavor.get('swap', 0) != flavor.get('swap', 0)):
 
+                    on_execute = lambda process: self.job_tracker.add_job(
+                        instance, process.pid)
+                    on_completion = lambda process: self.job_tracker.\
+                        remove_job(instance, process.pid)
                     compression = info['type'] not in NO_COMPRESSION_TYPES
                     libvirt_utils.copy_image(from_path, img_path, host=dest,
                                              on_execute=on_execute,
                                              on_completion=on_completion,
                                              compression=compression)
-
-            # Ensure disk.info is written to the new path to avoid disks being
-            # reinspected and potentially changing format.
-            src_disk_info_path = os.path.join(inst_base_resize, 'disk.info')
-            if os.path.exists(src_disk_info_path):
-                dst_disk_info_path = os.path.join(inst_base, 'disk.info')
-                libvirt_utils.copy_image(src_disk_info_path,
-                                         dst_disk_info_path,
-                                         host=dest, on_execute=on_execute,
-                                         on_completion=on_completion)
         except Exception:
             with excutils.save_and_reraise_exception():
                 self._cleanup_remote_migration(dest, inst_base,
@@ -6885,7 +6814,7 @@ class LibvirtDriver(driver.ComputeDriver):
             raise loopingcall.LoopingCallDone()
 
     @staticmethod
-    def _disk_size_from_instance(instance, disk_name):
+    def _disk_size_from_instance(instance, info):
         """Determines the disk size from instance properties
 
         Returns the disk size by using the disk name to determine whether it
@@ -6894,13 +6823,11 @@ class LibvirtDriver(driver.ComputeDriver):
 
         Returns 0 if the disk name not match (disk, disk.local).
         """
-        if disk_name == 'disk':
+        fname = os.path.basename(info['path'])
+        if fname == 'disk':
             size = instance.root_gb
-        elif disk_name == 'disk.local':
+        elif fname == 'disk.local':
             size = instance.ephemeral_gb
-        # N.B. We don't handle ephemeral disks named disk.ephN here,
-        # which is almost certainly a bug. It's not clear what this function
-        # should return if an instance has multiple ephemeral disks.
         else:
             size = 0
         return size * units.Gi
@@ -6963,74 +6890,28 @@ class LibvirtDriver(driver.ComputeDriver):
 
         image_meta = objects.ImageMeta.from_dict(image_meta)
 
-        block_disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
-                                                  instance,
-                                                  image_meta,
-                                                  block_device_info)
-        # assume _create_image does nothing if a target file exists.
-        # NOTE: This has the intended side-effect of fetching a missing
-        # backing file.
-        self._create_image(context, instance, block_disk_info['mapping'],
+        # resize disks. only "disk" and "disk.local" are necessary.
+        disk_info = jsonutils.loads(disk_info)
+        for info in disk_info:
+            size = self._disk_size_from_instance(instance, info)
+            if resize_instance:
+                image = imgmodel.LocalFileImage(info['path'],
+                                                info['type'])
+                self._disk_resize(image, size)
+            if info['type'] == 'raw' and CONF.use_cow_images:
+                self._disk_raw_to_qcow2(info['path'])
+
+        disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
+                                            instance,
+                                            image_meta,
+                                            block_device_info)
+        # assume _create_image do nothing if a target file exists.
+        self._create_image(context, instance, disk_info['mapping'],
                            network_info=network_info,
                            block_device_info=None, inject_files=False,
                            fallback_from_host=migration.source_compute)
-
-        # Resize root disk and a single ephemeral disk called disk.local
-        # Also convert raw disks to qcow2 if migrating to host which uses
-        # qcow2 from host which uses raw.
-        # TODO(mbooth): Handle resize of multiple ephemeral disks, and
-        #               ephemeral disks not called disk.local.
-        disk_info = jsonutils.loads(disk_info)
-        for info in disk_info:
-            path = info['path']
-            disk_name = os.path.basename(path)
-
-            size = self._disk_size_from_instance(instance, disk_name)
-            if resize_instance:
-                image = imgmodel.LocalFileImage(path, info['type'])
-                self._disk_resize(image, size)
-
-            # NOTE(mdbooth): The code below looks wrong, but is actually
-            # required to prevent a security hole when migrating from a host
-            # with use_cow_images=False to one with use_cow_images=True.
-            # Imagebackend uses use_cow_images to select between the
-            # atrociously-named-Raw and Qcow2 backends. The Qcow2 backend
-            # writes to disk.info, but does not read it as it assumes qcow2.
-            # Therefore if we don't convert raw to qcow2 here, a raw disk will
-            # be incorrectly assumed to be qcow2, which is a severe security
-            # flaw. The reverse is not true, because the atrociously-named-Raw
-            # backend supports both qcow2 and raw disks, and will choose
-            # appropriately between them as long as disk.info exists and is
-            # correctly populated, which it is because Qcow2 writes to
-            # disk.info.
-            #
-            # In general, we do not yet support format conversion during
-            # migration. For example:
-            #   * Converting from use_cow_images=True to use_cow_images=False
-            #     isn't handled. This isn't a security bug, but is almost
-            #     certainly buggy in other cases, as the 'Raw' backend doesn't
-            #     expect a backing file.
-            #   * Converting to/from lvm and rbd backends is not supported.
-            #
-            # This behaviour is inconsistent, and therefore undesirable for
-            # users. It is tightly-coupled to implementation quirks of 2
-            # out of 5 backends in imagebackend and defends against a severe
-            # security flaw which is not at all obvious without deep analysis,
-            # and is therefore undesirable to developers. We should aim to
-            # remove it. This will not be possible, though, until we can
-            # represent the storage layout of a specific instance
-            # independent of the default configuration of the local compute
-            # host.
-
-            # Config disks are hard-coded to be raw even when
-            # use_cow_images=True (see _get_disk_config_image_type),so don't
-            # need to be converted.
-            if (disk_name != 'disk.config' and
-                        info['type'] == 'raw' and CONF.use_cow_images):
-                self._disk_raw_to_qcow2(info['path'])
-
-        xml = self._get_guest_xml(context, instance, network_info,
-                                  block_disk_info, image_meta,
+        xml = self._get_guest_xml(context, instance, network_info, disk_info,
+                                  image_meta,
                                   block_device_info=block_device_info,
                                   write_to_disk=True)
         # NOTE(mriedem): vifs_already_plugged=True here, regardless of whether
@@ -7039,7 +6920,7 @@ class LibvirtDriver(driver.ComputeDriver):
         # L2 agent (or neutron server) so neutron may not know that the VIF was
         # unplugged in the first place and never send an event.
         self._create_domain_and_network(context, xml, instance, network_info,
-                                        block_disk_info,
+                                        disk_info,
                                         block_device_info=block_device_info,
                                         power_on=power_on,
                                         vifs_already_plugged=True)
@@ -7078,26 +6959,6 @@ class LibvirtDriver(driver.ComputeDriver):
             utils.execute('mv', inst_base_resize, inst_base)
 
         image_meta = objects.ImageMeta.from_instance(instance)
-
-        backend = self.image_backend.image(instance, 'disk')
-        # Once we rollback, the snapshot is no longer needed, so remove it
-        # TODO(nic): Remove the try/except/finally in a future release
-        # To avoid any upgrade issues surrounding instances being in pending
-        # resize state when the software is updated, this portion of the
-        # method logs exceptions rather than failing on them.  Once it can be
-        # reasonably assumed that no such instances exist in the wild
-        # anymore, the try/except/finally should be removed,
-        # and ignore_errors should be set back to False (the default) so
-        # that problems throw errors, like they should.
-        if backend.check_image_exists():
-            try:
-                backend.rollback_to_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME)
-            except exception.SnapshotNotFound:
-                LOG.warning(_LW("Failed to rollback snapshot (%s)"),
-                            libvirt_utils.RESIZE_SNAPSHOT_NAME)
-            finally:
-                backend.remove_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME,
-                                    ignore_errors=True)
 
         disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
                                             instance,
@@ -7288,7 +7149,14 @@ class LibvirtDriver(driver.ComputeDriver):
         # instance is reachable.
         shared_block_storage = (self.image_backend.backend().
                                 is_shared_block_storage())
-        return shared_instance_path or shared_block_storage
+
+        context = nova_context.get_admin_context()
+        bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                context, instance.uuid)
+        have_root_bdm = (bdms and any(bdm.is_volume and bdm.is_root
+                                      for bdm in bdms))
+
+        return shared_instance_path or shared_block_storage or have_root_bdm
 
     def inject_network_info(self, instance, nw_info):
         self.firewall_driver.setup_basic_filtering(instance, nw_info)

@@ -814,7 +814,7 @@ class ComputeManager(manager.Manager):
         """
         filters = {
             'source_compute': self.host,
-            'status': ['accepted', 'done'],
+            'status': 'accepted',
             'migration_type': 'evacuation',
         }
         evacuations = objects.MigrationList.get_by_filters(context, filters)
@@ -2045,8 +2045,7 @@ class ComputeManager(manager.Manager):
         except (exception.FlavorDiskTooSmall,
                 exception.FlavorMemoryTooSmall,
                 exception.ImageNotActive,
-                exception.ImageUnacceptable,
-                exception.InvalidDiskInfo) as e:
+                exception.ImageUnacceptable) as e:
             self._notify_about_instance_usage(context, instance,
                     'create.error', fault=e)
             raise exception.BuildAbortException(instance_uuid=instance.uuid,
@@ -2296,19 +2295,10 @@ class ComputeManager(manager.Manager):
                           instance=instance)
             except (cinder_exception.EndpointNotFound,
                     keystone_exception.EndpointNotFound) as exc:
-                LOG.warning(_LW('Ignoring EndpointNotFound for '
-                                'volume %(volume_id)s: %(exc)s'),
-                            {'exc': exc, 'volume_id': bdm.volume_id},
+                LOG.warning(_LW('Ignoring EndpointNotFound: %s'), exc,
                             instance=instance)
             except cinder_exception.ClientException as exc:
-                LOG.warning(_LW('Ignoring unknown cinder exception for '
-                                'volume %(volume_id)s: %(exc)s'),
-                            {'exc': exc, 'volume_id': bdm.volume_id},
-                            instance=instance)
-            except Exception as exc:
-                LOG.warning(_LW('Ignoring unknown exception for '
-                                'volume %(volume_id)s: %(exc)s'),
-                            {'exc': exc, 'volume_id': bdm.volume_id},
+                LOG.warning(_LW('Ignoring Unknown cinder exception: %s'), exc,
                             instance=instance)
 
         if notify:
@@ -2416,22 +2406,6 @@ class ComputeManager(manager.Manager):
 
         @utils.synchronized(instance.uuid)
         def do_terminate_instance(instance, bdms):
-            # NOTE(mriedem): If we are deleting the instance while it was
-            # booting from volume, we could be racing with a database update of
-            # the BDM volume_id. Since the compute API passes the BDMs over RPC
-            # to compute here, the BDMs may be stale at this point. So check
-            # for any volume BDMs that don't have volume_id set and if we
-            # detect that, we need to refresh the BDM list before proceeding.
-            # TODO(mriedem): Move this into _delete_instance and make the bdms
-            # parameter optional.
-            for bdm in list(bdms):
-                if bdm.is_volume and not bdm.volume_id:
-                    LOG.debug('There are potentially stale BDMs during '
-                              'delete, refreshing the BlockDeviceMappingList.',
-                              instance=instance)
-                    bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
-                        context, instance.uuid)
-                    break
             try:
                 self._delete_instance(context, instance, bdms, quotas)
             except exception.InstanceNotFound:
@@ -2605,11 +2579,27 @@ class ComputeManager(manager.Manager):
             # partitions.
             raise exception.PreserveEphemeralNotSupported()
 
+        def _refresh_root_device(context, instance, bdms, image_meta):
+            root_bdms = [bdm for bdm in bdms if bdm.is_volume and bdm.is_root]
+            if not root_bdms:
+                return
+            if not image_meta or 'id' not in image_meta:
+                detail = (_("Rebuild failed due to invalid image_meta: %s"),
+                            image_meta)
+                raise exception.ValidationError(detail=detail)
+            for bdm in root_bdms:
+                self.volume_api.delete(context, bdm.volume_id)
+                bdm.volume_id = None
+                bdm.connection_info = None
+                bdm.image_id = image_meta['id']
+                bdm.save()
+
         if recreate:
             detach_block_devices(context, bdms)
         else:
             self._power_off_instance(context, instance, clean_shutdown=True)
             detach_block_devices(context, bdms)
+            _refresh_root_device(context, instance, bdms, image_meta)
             self.driver.destroy(context, instance,
                                 network_info=network_info,
                                 block_device_info=block_device_info)
@@ -2784,8 +2774,7 @@ class ComputeManager(manager.Manager):
         if image_ref:
             image_meta = self.image_api.get(context, image_ref)
         else:
-            image_meta = utils.get_image_from_system_metadata(
-                instance.system_metadata)
+            image_meta = {}
 
         # This instance.exists message should contain the original
         # image_ref, not the new one.  Since the DB has been updated
@@ -3218,6 +3207,132 @@ class ComputeManager(manager.Manager):
             _msg = _('error setting admin password')
             raise exception.InstancePasswordSetFailed(
                 instance=instance.uuid, reason=_msg)
+
+    @wrap_exception()
+    @reverts_task_state
+    @wrap_instance_event
+    @wrap_instance_fault
+    def set_vcpus(self, context, instance, new_vcpus):
+        """Set the vcpus for an instance on this host.
+
+        This is generally only called by API set vcpus.
+
+        @param context: Nova auth context.
+        @param instance: Nova instance object.
+        @param new_vcpus: The amount of vcpus for the instance.
+        """
+
+        context = context.elevated()
+        if new_vcpus is None:
+            raise NotImplementedError(_('new_vcpus is null'))
+
+        current_power_state = self._get_power_state(context, instance)
+        expected_state = (power_state.RUNNING, power_state.PAUSED,
+                          power_state.SHUTDOWN)
+
+        if current_power_state not in expected_state:
+            instance.task_state = None
+            instance.save(expected_task_state=task_states.UPDATING_VCPUS)
+            _msg = _('instance %s is not running') % instance.uuid
+            raise exception.InstanceVcpusSetFailed(
+                instance=instance.uuid, reason=_msg)
+
+        try:
+            self.driver.set_vcpus(instance, new_vcpus)
+            LOG.info(_LI("Vcpus set"), instance=instance)
+            instance.task_state = None
+            instance.save(
+                expected_task_state=task_states.UPDATING_VCPUS)
+        except NotImplementedError:
+            LOG.warning(_LW('set_vcpus is not implemented '
+                            'by this driver or guest instance.'),
+                        instance=instance)
+            instance.task_state = None
+            instance.save(
+                expected_task_state=task_states.UPDATING_VCPUS)
+            raise NotImplementedError(_('set_vcpus is not '
+                                        'implemented by this driver or guest '
+                                        'instance.'))
+        except exception.UnexpectedTaskStateError:
+            # interrupted by another (most likely delete) task
+            # do not retry
+            raise
+        except Exception:
+            # Catch all here because this could be anything.
+            LOG.exception(_LE('set_vcpus failed'),
+                          instance=instance)
+            self._set_instance_obj_error_state(context, instance)
+            # We create a new exception here so that we won't
+            # potentially reveal password information to the
+            # API caller.  The real exception is logged above
+            _msg = _('error setting vcpus')
+            raise exception.InstanceVcpusSetFailed(
+                instance=instance.uuid, reason=_msg)
+        instance.vcpus = new_vcpus
+        instance.save()
+
+    @wrap_exception()
+    @reverts_task_state
+    @wrap_instance_event
+    @wrap_instance_fault
+    def set_mem(self, context, instance, new_mem):
+        """Set the memory for an instance on this host.
+
+        This is generally only called by API set memory.
+
+        @param context: Nova auth context.
+        @param instance: Nova instance object.
+        @param new_mem: The amount of memory for the instance.
+        """
+
+        context = context.elevated()
+        if new_mem is None:
+            raise NotImplementedError(_('new_mem is null'))
+
+        current_power_state = self._get_power_state(context, instance)
+        expected_state = (power_state.RUNNING, power_state.PAUSED,
+                          power_state.SHUTDOWN)
+
+        if current_power_state not in expected_state:
+            instance.task_state = None
+            instance.save(expected_task_state=task_states.UPDATING_MEM)
+            _msg = _('instance %s is not running') % instance.uuid
+            raise exception.InstanceVcpusSetFailed(
+                instance=instance.uuid, reason=_msg)
+
+        try:
+            self.driver.set_mem(instance, new_mem)
+            LOG.info(_LI("Mem set"), instance=instance)
+            instance.task_state = None
+            instance.save(
+                expected_task_state=task_states.UPDATING_MEM)
+        except NotImplementedError:
+            LOG.warning(_LW('set_mem is not implemented '
+                            'by this driver or guest instance.'),
+                        instance=instance)
+            instance.task_state = None
+            instance.save(
+                expected_task_state=task_states.UPDATING_MEM)
+            raise NotImplementedError(_('set_mem is not '
+                                        'implemented by this driver or guest '
+                                        'instance.'))
+        except exception.UnexpectedTaskStateError:
+            # interrupted by another (most likely delete) task
+            # do not retry
+            raise
+        except Exception:
+            # Catch all here because this could be anything.
+            LOG.exception(_LE('set_mem failed'),
+                          instance=instance)
+            self._set_instance_obj_error_state(context, instance)
+            # We create a new exception here so that we won't
+            # potentially reveal password information to the
+            # API caller.  The real exception is logged above
+            _msg = _('error setting mem')
+            raise exception.InstanceMemSetFailed(
+                instance=instance.uuid, reason=_msg)
+        instance.memory_mb = new_mem
+        instance.save()
 
     @wrap_exception()
     @reverts_task_state
@@ -4696,8 +4811,6 @@ class ComputeManager(manager.Manager):
                               context=context, instance=instance)
                 self.volume_api.roll_detaching(context, volume_id)
 
-        return connection_info
-
     def _detach_volume(self, context, volume_id, instance, destroy_bdm=True):
         """Detach a volume from an instance.
 
@@ -4741,46 +4854,8 @@ class ComputeManager(manager.Manager):
                 self.notifier.info(context, 'volume.usage',
                                    compute_utils.usage_volume_info(vol_usage))
 
-        connection_info = self._driver_detach_volume(context, instance, bdm)
+        self._driver_detach_volume(context, instance, bdm)
         connector = self.driver.get_volume_connector(instance)
-
-        if connection_info and not destroy_bdm and (
-           connector.get('host') != instance.host):
-            # If the volume is attached to another host (evacuate) then
-            # this connector is for the wrong host. Use the connector that
-            # was stored in connection_info instead (if we have one, and it
-            # is for the expected host).
-            stashed_connector = connection_info.get('connector')
-            if not stashed_connector:
-                # Volume was attached before we began stashing connectors
-                LOG.warning(_LW("Host mismatch detected, but stashed "
-                                "volume connector not found. Instance host is "
-                                "%(ihost)s, but volume connector host is "
-                                "%(chost)s."),
-                            {'ihost': instance.host,
-                             'chost': connector.get('host')})
-            elif stashed_connector.get('host') != instance.host:
-                # Unexpected error. The stashed connector is also not matching
-                # the needed instance host.
-                LOG.error(_LE("Host mismatch detected in stashed volume "
-                              "connector. Will use local volume connector. "
-                              "Instance host is %(ihost)s. Local volume "
-                              "connector host is %(chost)s. Stashed volume "
-                              "connector host is %(schost)s."),
-                          {'ihost': instance.host,
-                           'chost': connector.get('host'),
-                           'schost': stashed_connector.get('host')})
-            else:
-                # Fix found. Use stashed connector.
-                LOG.debug("Host mismatch detected. Found usable stashed "
-                          "volume connector. Instance host is %(ihost)s. "
-                          "Local volume connector host was %(chost)s. "
-                          "Stashed volume connector host is %(schost)s.",
-                          {'ihost': instance.host,
-                           'chost': connector.get('host'),
-                           'schost': stashed_connector.get('host')})
-                connector = stashed_connector
-
         self.volume_api.terminate_connection(context, volume_id, connector)
 
         if destroy_bdm:
@@ -5410,32 +5485,24 @@ class ComputeManager(manager.Manager):
         block_device_info = self._get_instance_block_device_info(context,
                                                                  instance)
 
+        self.driver.post_live_migration_at_destination(context, instance,
+                                            network_info,
+                                            block_migration, block_device_info)
+        # Restore instance state
+        current_power_state = self._get_power_state(context, instance)
+        node_name = None
+        prev_host = instance.host
         try:
-            self.driver.post_live_migration_at_destination(
-                context, instance, network_info, block_migration,
-                block_device_info)
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                instance.vm_state = vm_states.ERROR
-                LOG.error(_LE('Unexpected error during post live migration at '
-                              'destination host.'), instance=instance)
+            compute_node = self._get_compute_info(context, self.host)
+            node_name = compute_node.hypervisor_hostname
+        except exception.ComputeHostNotFound:
+            LOG.exception(_LE('Failed to get compute_info for %s'), self.host)
         finally:
-            # Restore instance state and update host
-            current_power_state = self._get_power_state(context, instance)
-            node_name = None
-            prev_host = instance.host
-            try:
-                compute_node = self._get_compute_info(context, self.host)
-                node_name = compute_node.hypervisor_hostname
-            except exception.ComputeHostNotFound:
-                LOG.exception(_LE('Failed to get compute_info for %s'),
-                              self.host)
-            finally:
-                instance.host = self.host
-                instance.power_state = current_power_state
-                instance.task_state = None
-                instance.node = node_name
-                instance.save(expected_task_state=task_states.MIGRATING)
+            instance.host = self.host
+            instance.power_state = current_power_state
+            instance.task_state = None
+            instance.node = node_name
+            instance.save(expected_task_state=task_states.MIGRATING)
 
         # NOTE(tr3buchet): tear down networks on source host
         self.network_api.setup_networks_on_host(context, instance,

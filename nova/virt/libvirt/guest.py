@@ -29,7 +29,6 @@ then used by all the other libvirt related classes
 
 from lxml import etree
 from oslo_log import log as logging
-from oslo_service import loopingcall
 from oslo_utils import encodeutils
 from oslo_utils import excutils
 from oslo_utils import importutils
@@ -278,55 +277,6 @@ class Guest(object):
                 devs.append(dev)
         return devs
 
-    def detach_device_with_retry(self, get_device_conf_func, device,
-                                 persistent, live, max_retry_count=7,
-                                 inc_sleep_time=2,
-                                 max_sleep_time=30):
-        """Detaches a device from the guest. After the initial detach request,
-        a function is returned which can be used to ensure the device is
-        successfully removed from the guest domain (retrying the removal as
-        necessary).
-
-        :param get_device_conf_func: function which takes device as a parameter
-                                     and returns the configuration for device
-        :param device: device to detach
-        :param persistent: bool to indicate whether the change is
-                           persistent or not
-        :param live: bool to indicate whether it affects the guest in running
-                     state
-        :param max_retry_count: number of times the returned function will
-                                retry a detach before failing
-        :param inc_sleep_time: incremental time to sleep in seconds between
-                               detach retries
-        :param max_sleep_time: max sleep time in seconds beyond which the sleep
-                               time will not be incremented using param
-                               inc_sleep_time. On reaching this threshold,
-                               max_sleep_time will be used as the sleep time.
-        """
-
-        conf = get_device_conf_func(device)
-        if conf is None:
-            raise exception.DeviceNotFound(device=device)
-
-        self.detach_device(conf, persistent, live)
-
-        @loopingcall.RetryDecorator(max_retry_count=max_retry_count,
-                                    inc_sleep_time=inc_sleep_time,
-                                    max_sleep_time=max_sleep_time,
-                                    exceptions=exception.DeviceDetachFailed)
-        def _do_wait_and_retry_detach():
-            config = get_device_conf_func(device)
-            if config is not None:
-                # Device is already detached from persistent domain
-                # and only transient domain needs update
-                self.detach_device(config, persistent=False, live=live)
-                # Raise error since the device still existed on the guest
-                reason = _("Unable to detach from guest transient domain.")
-                raise exception.DeviceDetachFailed(device=device,
-                                                   reason=reason)
-
-        return _do_wait_and_retry_detach
-
     def detach_device(self, conf, persistent=False, live=False):
         """Detaches device to the guest.
 
@@ -369,6 +319,23 @@ class Guest(object):
     def set_user_password(self, user, new_pass):
         """Configures a new user password."""
         self._domain.setUserPassword(user, new_pass, 0)
+
+    def set_vcpus(self, new_vcpus, persistent=False, live=False,
+                  modify_cpu_state=False, current=False):
+        """Configures new vcpus."""
+        flags = persistent and libvirt.VIR_DOMAIN_AFFECT_CONFIG or 0
+        flags |= live and libvirt.VIR_DOMAIN_AFFECT_LIVE or 0
+        flags |= modify_cpu_state and libvirt.VIR_DOMAIN_VCPU_GUEST or 0
+        flags |= current and libvirt.VIR_DOMAIN_AFFECT_CURRENT or 0
+        self._domain.setVcpusFlags(new_vcpus, flags=flags)
+
+    def set_mem(self, new_mem, persistent=False, live=False,
+                current=False):
+        """Configures new memory."""
+        flags = persistent and libvirt.VIR_DOMAIN_AFFECT_CONFIG or 0
+        flags |= live and libvirt.VIR_DOMAIN_AFFECT_LIVE or 0
+        flags |= current and libvirt.VIR_DOMAIN_AFFECT_CURRENT or 0
+        self._domain.setMemoryFlags(new_mem, flags=flags)
 
     def _get_domain_info(self, host):
         """Returns information on Guest

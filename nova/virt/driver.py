@@ -1013,6 +1013,22 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
+    def set_vcpus(self, instance, new_vcpus):
+        """Set the vcpus on the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        :param new_vcpus: the new vcpus
+        """
+        raise NotImplementedError()
+
+    def set_mem(self, instance, new_mem):
+        """Set the memory on the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        :param new_mem: the new memory
+        """
+        raise NotImplementedError()
+
     def inject_file(self, instance, b64_path, b64_contents):
         """Writes a file on the specified instance.
 

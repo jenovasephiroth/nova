@@ -219,6 +219,15 @@ admin_password = {
     'type': 'string',
 }
 
+server_vcpus = {
+    'type': ['integer', 'string'],
+    'pattern': '^[0-9]*$', 'minimum': 1
+}
+
+server_mem = {
+    'type': ['integer', 'string'],
+    'pattern': '^[0-9]*$', 'minimum': 1
+}
 
 image_ref = {
     'type': 'string',
