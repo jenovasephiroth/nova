@@ -89,6 +89,7 @@ from nova.virt import block_device as driver_block_device
 from nova.virt import configdrive
 from nova.virt import driver
 from nova.virt import event as virtevent
+from nova.virt import hardware
 from nova.virt import storage_users
 from nova.virt import virtapi
 from nova import volume
@@ -162,8 +163,8 @@ interval_opts = [
     cfg.IntOpt('shelved_offload_time',
                default=0,
                help='Time in seconds before a shelved instance is eligible '
-                    'for removing from a host. -1 never offload, 0 offload '
-                    'immediately when shelved'),
+                    'for removing from a host.  -1 never offload, 0 offload '
+                    'when shelved'),
     cfg.IntOpt('instance_delete_interval',
                default=300,
                help='Interval in seconds for retrying failed instance file '
@@ -267,21 +268,15 @@ def errors_out_migration(function):
     def decorated_function(self, context, *args, **kwargs):
         try:
             return function(self, context, *args, **kwargs)
-        except Exception as ex:
+        except Exception:
             with excutils.save_and_reraise_exception():
                 wrapped_func = utils.get_wrapped_function(function)
                 keyed_args = safe_utils.getcallargs(wrapped_func, context,
                                                     *args, **kwargs)
                 migration = keyed_args['migration']
-
-                # NOTE(rajesht): If InstanceNotFound error is thrown from
-                # decorated function, migration status should be set to
-                # 'error', without checking current migration status.
-                if not isinstance(ex, exception.InstanceNotFound):
-                    status = migration.status
-                    if status not in ['migrating', 'post-migrating']:
-                        return
-
+                status = migration.status
+                if status not in ['migrating', 'post-migrating']:
+                    return
                 migration.status = 'error'
                 try:
                     with migration.obj_as_admin():
@@ -426,11 +421,6 @@ def object_compat(function):
     def decorated_function(self, context, *args, **kwargs):
         def _load_instance(instance_or_dict):
             if isinstance(instance_or_dict, dict):
-                # try to get metadata and system_metadata for most cases but
-                # only attempt to load those if the db instance already has
-                # those fields joined
-                metas = [meta for meta in ('metadata', 'system_metadata')
-                         if meta in instance_or_dict]
                 instance = objects.Instance._from_db_object(
                     context, objects.Instance(), instance_or_dict,
                     expected_attrs=metas)
@@ -438,6 +428,7 @@ def object_compat(function):
                 return instance
             return instance_or_dict
 
+        metas = ['metadata', 'system_metadata']
         try:
             kwargs['instance'] = _load_instance(kwargs['instance'])
         except KeyError:
@@ -564,10 +555,6 @@ class InstanceEvents(object):
         """
         @utils.synchronized(self._lock_name(instance))
         def _clear_events():
-            if self._events is None:
-                LOG.debug('Unexpected attempt to clear events during shutdown',
-                          instance=instance)
-                return dict()
             return self._events.pop(instance.uuid, {})
         return _clear_events()
 
@@ -667,7 +654,7 @@ class ComputeVirtAPI(virtapi.VirtAPI):
 class ComputeManager(manager.Manager):
     """Manages the running instances from creation to destruction."""
 
-    target = messaging.Target(version='3.40')
+    target = messaging.Target(version='3.41')
 
     # How long to wait in seconds before re-issuing a shutdown
     # signal to a instance during power off.  The overall
@@ -894,20 +881,20 @@ class ComputeManager(manager.Manager):
         """Complete deletion for instances in DELETED status but not marked as
         deleted in the DB
         """
-        system_meta = instance.system_metadata
         instance.destroy()
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
                 context, instance.uuid)
-        quotas = objects.Quotas(context=context)
+        quotas = objects.Quotas(context)
         project_id, user_id = objects.quotas.ids_from_instance(context,
                                                                instance)
-        quotas.reserve(project_id=project_id, user_id=user_id, instances=-1,
-                       cores=-instance.vcpus, ram=-instance.memory_mb)
+        quotas.reserve(context, project_id=project_id, user_id=user_id,
+                       instances=-1, cores=-instance.vcpus,
+                       ram=-instance.memory_mb)
         self._complete_deletion(context,
                                 instance,
                                 bdms,
                                 quotas,
-                                system_meta)
+                                instance.system_metadata)
 
     def _complete_deletion(self, context, instance, bdms,
                            quotas, system_meta):
@@ -1284,7 +1271,7 @@ class ComputeManager(manager.Manager):
         self.driver.init_host(host=self.host)
         context = nova.context.get_admin_context()
         instances = objects.InstanceList.get_by_host(
-            context, self.host, expected_attrs=['info_cache', 'metadata'])
+            context, self.host, expected_attrs=['info_cache'])
 
         if CONF.defer_iptables_apply:
             self.driver.filter_defer_apply_on()
@@ -1558,7 +1545,7 @@ class ComputeManager(manager.Manager):
         rt = self._get_resource_tracker(node)
         try:
             limits = filter_properties.get('limits', {})
-            with rt.instance_claim(context, instance, limits):
+            with rt.instance_claim(context, instance, limits) as inst_claim:
                 # NOTE(russellb) It's important that this validation be done
                 # *after* the resource tracker instance claim, as that is where
                 # the host is set on the instance.
@@ -1578,6 +1565,7 @@ class ComputeManager(manager.Manager):
 
                 instance.vm_state = vm_states.BUILDING
                 instance.task_state = task_states.BLOCK_DEVICE_MAPPING
+                instance.numa_topology = inst_claim.claimed_numa_topology
                 instance.save()
 
                 block_device_info = self._prep_block_device(
@@ -2321,7 +2309,7 @@ class ComputeManager(manager.Manager):
                 extra_usage_info={'image_name': image_name})
         try:
             rt = self._get_resource_tracker(node)
-            with rt.instance_claim(context, instance, limits):
+            with rt.instance_claim(context, instance, limits) as inst_claim:
                 # NOTE(russellb) It's important that this validation be done
                 # *after* the resource tracker instance claim, as that is where
                 # the host is set on the instance.
@@ -2332,6 +2320,7 @@ class ComputeManager(manager.Manager):
                         block_device_mapping) as resources:
                     instance.vm_state = vm_states.BUILDING
                     instance.task_state = task_states.SPAWNING
+                    instance.numa_topology = inst_claim.claimed_numa_topology
                     # NOTE(JoshNang) This also saves the changes to the
                     # instance from _allocate_network_async, as they aren't
                     # saved in that function to prevent races.
@@ -3074,8 +3063,7 @@ class ComputeManager(manager.Manager):
             def detach_block_devices(context, bdms):
                 for bdm in bdms:
                     if bdm.is_volume:
-                        self._detach_volume(context, bdm.volume_id, instance,
-                                            destroy_bdm=False)
+                        self.volume_api.detach(context, bdm.volume_id)
 
             files = self._decode_files(injected_files)
 
@@ -3739,7 +3727,6 @@ class ComputeManager(manager.Manager):
     @wrap_exception()
     @reverts_task_state
     @wrap_instance_event
-    @errors_out_migration
     @wrap_instance_fault
     def revert_resize(self, context, instance, migration, reservations):
         """Destroys the new instance on the destination machine.
@@ -3796,7 +3783,6 @@ class ComputeManager(manager.Manager):
     @wrap_exception()
     @reverts_task_state
     @wrap_instance_event
-    @errors_out_migration
     @wrap_instance_fault
     def finish_revert_resize(self, context, instance, reservations, migration):
         """Finishes the second half of reverting a resize.
@@ -4005,6 +3991,77 @@ class ComputeManager(manager.Manager):
         else:
             # not re-scheduling
             raise exc_info[0], exc_info[1], exc_info[2]
+
+    @wrap_exception()
+    @reverts_task_state
+    @wrap_instance_event
+    @wrap_instance_fault
+    def live_resize_instance(self, context, image, instance, instance_type,
+                             reservations):
+        """Starts the live resize of a running instance."""
+
+        quotas = objects.Quotas.from_reservations(context,
+                                                  reservations,
+                                                  instance=instance)
+
+        with self._error_out_instance_on_exception(context, instance,
+                                                   quotas=quotas):
+            # TODO(chaochin) Remove this until v5 RPC API
+            # Code downstream may expect extra_specs to be populated since it
+            # is receiving an object, so lookup the flavor to ensure this.
+            if instance_type and not isinstance(instance_type, objects.Flavor):
+                instance_type = objects.Flavor.get_by_id(context,
+                                                         instance_type['id'])
+
+            self._notify_about_instance_usage(context, instance,
+                                              "live_resize.start")
+
+            self._check_live_resize_constraints(context, image,
+                                                instance, instance_type)
+            self.driver.live_resize(context, image, instance, instance_type)
+            self._set_instance_info(instance, instance_type)
+            quotas.commit()
+
+            instance.task_state = None
+            instance.save(expected_task_state=task_states.LIVE_RESIZED)
+
+            self._notify_about_instance_usage(
+                context, instance, "live_resize.end")
+            self.instance_events.clear_events_for_instance(instance)
+
+    def _check_live_resize_constraints(self, context, image,
+                                       instance, instance_type):
+        """Check on live-resize constraints.
+
+        This functions will be called by live_resize_instance.
+        """
+        # Convert the system metadata to image metadata
+        image_meta = utils.get_image_from_system_metadata(instance.system_metadata)
+        if not image_meta:
+            image_ref = instance.get('image_ref')
+            image_meta = compute_utils.get_image_metadata(context,
+                                                    self._image_api,
+                                                    image_ref,
+                                                    instance)
+
+        old_instance_type = objects.Flavor.get_by_id(
+            context, instance['instance_type_id'])
+        old_limits = hardware.get_live_resize_constraints(old_instance_type,
+                                                          image_meta)
+        limits = hardware.get_live_resize_constraints(instance_type,
+                                                      image_meta)
+        violations = list()
+        if limits['max_vcpus'] > old_limits['max_vcpus']:
+            violations.append('max_vcpus')
+        if limits['max_memory'] > old_limits['max_memory']:
+            violations.append('max_memory')
+        if limits['max_memory_slots'] > old_limits['max_memory_slots']:
+            violations.append('max_memory_slots')
+
+        if violations:
+            raise exception.NovaException(
+                _("cannot live-resize to a flavor with greater limits "
+                  " for %(resources)s") % {'resources': violations})
 
     @wrap_exception()
     @reverts_task_state
@@ -4535,18 +4592,13 @@ class ComputeManager(manager.Manager):
         if image:
             shelved_image_ref = instance.image_ref
             instance.image_ref = image['id']
-            image_meta = image
-        else:
-            image_meta = utils.get_image_from_system_metadata(
-                instance.system_metadata)
 
         self.network_api.setup_instance_network_on_host(context, instance,
                                                         self.host)
         network_info = self._get_instance_nw_info(context, instance)
         try:
             with rt.instance_claim(context, instance, limits):
-                self.driver.spawn(context, instance, image_meta,
-                                  injected_files=[],
+                self.driver.spawn(context, instance, image, injected_files=[],
                                   admin_password=None,
                                   network_info=network_info,
                                   block_device_info=block_device_info)
@@ -4864,7 +4916,7 @@ class ComputeManager(manager.Manager):
         self._notify_about_instance_usage(
             context, instance, "volume.attach", extra_usage_info=info)
 
-    def _driver_detach_volume(self, context, instance, bdm):
+    def _detach_volume(self, context, instance, bdm):
         """Do the actual driver detach using block device mapping."""
         mp = bdm.device_name
         volume_id = bdm.volume_id
@@ -4903,18 +4955,12 @@ class ComputeManager(manager.Manager):
                               context=context, instance=instance)
                 self.volume_api.roll_detaching(context, volume_id)
 
-    def _detach_volume(self, context, volume_id, instance, destroy_bdm=True):
-        """Detach a volume from an instance.
-
-        :param context: security context
-        :param volume_id: the volume id
-        :param instance: the Instance object to detach the volume from
-        :param destroy_bdm: if True, the corresponding BDM entry will be marked
-                            as deleted. Disabling this is useful for operations
-                            like rebuild, when we don't want to destroy BDM
-
-        """
-
+    @object_compat
+    @wrap_exception()
+    @reverts_task_state
+    @wrap_instance_fault
+    def detach_volume(self, context, volume_id, instance):
+        """Detach a volume from an instance."""
         bdm = objects.BlockDeviceMapping.get_by_volume_id(
                 context, volume_id)
         if CONF.volume_usage_poll_interval > 0:
@@ -4938,26 +4984,14 @@ class ComputeManager(manager.Manager):
                                                     instance,
                                                     update_totals=True)
 
-        self._driver_detach_volume(context, instance, bdm)
+        self._detach_volume(context, instance, bdm)
         connector = self.driver.get_volume_connector(instance)
         self.volume_api.terminate_connection(context, volume_id, connector)
-
-        if destroy_bdm:
-            bdm.destroy()
-
+        bdm.destroy()
         info = dict(volume_id=volume_id)
         self._notify_about_instance_usage(
             context, instance, "volume.detach", extra_usage_info=info)
         self.volume_api.detach(context.elevated(), volume_id)
-
-    @object_compat
-    @wrap_exception()
-    @reverts_task_state
-    @wrap_instance_fault
-    def detach_volume(self, context, volume_id, instance):
-        """Detach a volume from an instance."""
-
-        self._detach_volume(context, volume_id, instance)
 
     def _init_volume_connection(self, context, new_volume_id,
                                 old_volume_id, connector, instance, bdm):
@@ -5074,7 +5108,7 @@ class ComputeManager(manager.Manager):
         try:
             bdm = objects.BlockDeviceMapping.get_by_volume_id(
                     context, volume_id)
-            self._driver_detach_volume(context, instance, bdm)
+            self._detach_volume(context, instance, bdm)
             connector = self.driver.get_volume_connector(instance)
             self.volume_api.terminate_connection(context, volume_id, connector)
         except exception.NotFound:
@@ -5827,9 +5861,6 @@ class ComputeManager(manager.Manager):
 
     @periodic_task.periodic_task(spacing=CONF.shelved_poll_interval)
     def _poll_shelved_instances(self, context):
-
-        if CONF.shelved_offload_time <= 0:
-            return
 
         filters = {'vm_state': vm_states.SHELVED,
                    'host': self.host}
@@ -6600,51 +6631,6 @@ class ComputeManager(manager.Manager):
                 with utils.temporary_mutation(context, read_deleted='yes'):
                     instance.save()
 
-    @periodic_task.periodic_task(spacing=CONF.instance_delete_interval)
-    def _cleanup_incomplete_migrations(self, context):
-        """Delete instance files on failed resize/revert-resize operation
-
-        During resize/revert-resize operation, if that instance gets deleted
-        in-between then instance files might remain either on source or
-        destination compute node because of race condition.
-        """
-        LOG.debug('Cleaning up deleted instances with incomplete migration ')
-        migration_filters = {'host': CONF.host,
-                             'status': 'error'}
-        migrations = objects.MigrationList.get_by_filters(context,
-                                                          migration_filters)
-
-        if not migrations:
-            return
-
-        inst_uuid_from_migrations = set([migration.instance_uuid for migration
-                                         in migrations])
-
-        inst_filters = {'deleted': True, 'soft_deleted': False,
-                        'uuid': inst_uuid_from_migrations}
-        attrs = ['info_cache', 'security_groups', 'system_metadata']
-        with utils.temporary_mutation(context, read_deleted='yes'):
-            instances = objects.InstanceList.get_by_filters(
-                context, inst_filters, expected_attrs=attrs, use_slave=True)
-
-        for instance in instances:
-            if instance.host != CONF.host:
-                for migration in migrations:
-                    if instance.uuid == migration.instance_uuid:
-                        # Delete instance files if not cleanup properly either
-                        # from the source or destination compute nodes when
-                        # the instance is deleted during resizing.
-                        self.driver.delete_instance_files(instance)
-                        try:
-                            migration.status = 'failed'
-                            with migration.obj_as_admin():
-                                migration.save()
-                        except exception.MigrationNotFound:
-                            LOG.warning(_LW("Migration %s is not found."),
-                                        migration.id, context=context,
-                                        instance=instance)
-                        break
-
     @messaging.expected_exceptions(exception.InstanceQuiesceNotSupported,
                                    exception.NovaException,
                                    NotImplementedError)
@@ -6808,6 +6794,12 @@ class _ComputeV4Proxy(object):
         return self.manager.live_migration(ctxt, dest, instance,
                                            block_migration,
                                            migrate_data=migrate_data)
+
+    def live_resize_instance(self, ctxt, image, instance, instance_type,
+                             reservations):
+        return self.manager.live_resize_instance(ctxt, image, instance,
+                                                 instance_type,
+                                                 reservations)
 
     def pause_instance(self, ctxt, instance):
         return self.manager.pause_instance(ctxt, instance)

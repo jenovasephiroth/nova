@@ -26,6 +26,7 @@ from nova import block_device
 from nova.compute import power_state
 from nova.compute import task_states
 from nova import exception
+from nova.i18n import _
 from nova.i18n import _LW
 from nova.network import model as network_model
 from nova import notifications
@@ -33,6 +34,7 @@ from nova import objects
 from nova import rpc
 from nova import utils
 from nova.virt import driver
+from nova.virt import hardware
 
 CONF = cfg.CONF
 CONF.import_opt('host', 'nova.netconf')

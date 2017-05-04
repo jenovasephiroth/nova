@@ -486,6 +486,17 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
+    def live_resize(self, context, instance, flavor, image):
+        """Live resizes an instance.
+
+        :param context: security context
+        :param nova.objects.instance.Instance instance:
+            The instance that will be live resized.
+        :param nova.objects.flavor.Flavor flavor:
+            The flavor to which the instance will be live resized to.
+        """
+        raise NotImplementedError()
+
     def snapshot(self, context, instance, image_id, update_task_state):
         """Snapshots the specified instance.
 

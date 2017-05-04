@@ -278,6 +278,19 @@ class Enum(String):
         return super(Enum, self).stringify(value)
 
 
+class LiveResize(Enum):
+
+    DISK = "disk"
+    MEMORY = "memory"
+    VCPUS = "vcpus"
+
+    ALL = (DISK, MEMORY, VCPUS)
+
+    def __init__(self):
+        super(LiveResize, self).__init__(
+            valid_values=LiveResize.ALL)
+
+
 class UUID(FieldType):
     @staticmethod
     def coerce(obj, attr, value):
@@ -720,3 +733,7 @@ class ListOfObjectsField(AutoTypedField):
     def __init__(self, objtype, **kwargs):
         self.AUTO_TYPE = List(Object(objtype))
         super(ListOfObjectsField, self).__init__(**kwargs)
+
+
+class LiveResizeField(AutoTypedField):
+    AUTO_TYPE = Set(LiveResize())

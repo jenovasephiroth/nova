@@ -46,3 +46,17 @@ user documentation.
   This change is required for the extraction of EC2 API into a standalone
   service. It exposes necessary properties absent in public nova APIs yet.
   Add info for Standalone EC2 API to cut access to Nova DB.
+
+- **2.4**
+
+  Added instance live-resize.
+
+  A user can request an instance to be live resized to a new flavor.
+
+  Live resize is requested via the API call ``POST /servers/<id>/action`` and
+  pass the following in the request body::
+  {
+      "live-resize" : {
+          "flavorRef" : "<flavor_id>",
+      }
+  }

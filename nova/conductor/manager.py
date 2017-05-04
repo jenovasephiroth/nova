@@ -33,12 +33,14 @@ from nova.compute import task_states
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 from nova.conductor.tasks import live_migrate
+from nova.conductor.tasks import live_resize
 from nova.db import base
 from nova import exception
 from nova.i18n import _, _LE, _LW
 from nova import image
 from nova import manager
 from nova import network
+from nova import utils
 from nova.network.security_group import openstack_driver
 from nova import notifications
 from nova import objects
@@ -469,7 +471,7 @@ class ComputeTaskManager(base.Base):
     may involve coordinating activities on multiple compute nodes.
     """
 
-    target = messaging.Target(namespace='compute_task', version='1.11')
+    target = messaging.Target(namespace='compute_task', version='1.12')
 
     def __init__(self):
         super(ComputeTaskManager, self).__init__()
@@ -636,6 +638,51 @@ class ComputeTaskManager(base.Base):
             _set_vm_state(context, instance, ex, vm_states.ERROR,
                           instance['task_state'])
             raise exception.MigrationError(reason=six.text_type(ex))
+
+    @messaging.expected_exceptions(exception.ComputeServiceUnavailable,
+                                   exception.InvalidLocalStorage,
+                                   exception.InvalidSharedStorage,
+                                   exception.HypervisorUnavailable,
+                                   exception.InstanceInvalidState,
+                                   exception.UnsupportedPolicyException)
+    def live_resize_instance(self, context, instance, flavor, reservations,
+                             scheduler_hint):
+        if instance and not isinstance(instance, nova_object.NovaObject):
+            # NOTE(danms): Until v2 of the RPC API, we need to tolerate
+            # old-world instance objects here
+            attrs = ['metadata', 'system_metadata', 'info_cache',
+                     'security_groups']
+            instance = objects.Instance._from_db_object(
+                context, objects.Instance(), instance,
+                expected_attrs=attrs)
+        # NOTE: Remove this when we drop support for v1 of the RPC API
+        if flavor and not isinstance(flavor, objects.Flavor):
+            # Code downstream may expect extra_specs to be populated since it
+            # is receiving an object, so lookup the flavor to ensure this.
+            flavor = objects.Flavor.get_by_id(context, flavor['id'])
+
+        image_ref = instance.image_ref
+        image = compute_utils.get_image_metadata(
+            context, self.image_api, image_ref, instance)
+
+        request_spec = scheduler_utils.build_request_spec(
+            context, image, [instance], instance_type=flavor)
+
+        quotas = objects.Quotas.from_reservations(context,
+                                                  reservations,
+                                                  instance=instance)
+
+        try:
+            live_resize.execute(context, image, instance,
+                                flavor, reservations)
+        except Exception as ex:
+            with excutils.save_and_reraise_exception():
+                updates = {'vm_state': instance.vm_state,
+                           'task_state': None}
+                self._set_vm_state_and_notify(context, instance.uuid,
+                                              'live_resize',
+                                              updates, ex, request_spec)
+                quotas.rollback()
 
     def build_instances(self, context, instances, image, filter_properties,
             admin_password, injected_files, requested_networks,

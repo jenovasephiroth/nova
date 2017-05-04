@@ -47,6 +47,9 @@ RESIZE_MIGRATING = 'resize_migrating'
 RESIZE_MIGRATED = 'resize_migrated'
 RESIZE_FINISH = 'resize_finish'
 
+# possible task states during live resize()
+LIVE_RESIZED = 'live_resized'
+
 # possible task states during revert_resize()
 RESIZE_REVERTING = 'resize_reverting'
 

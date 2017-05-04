@@ -33,7 +33,6 @@ import glob
 import mmap
 import operator
 import os
-import platform
 import shutil
 import sys
 import tempfile
@@ -96,7 +95,6 @@ from nova.virt.libvirt import firewall as libvirt_firewall
 from nova.virt.libvirt import host
 from nova.virt.libvirt import imagebackend
 from nova.virt.libvirt import imagecache
-from nova.virt.libvirt import instancejobtracker
 from nova.virt.libvirt import lvm
 from nova.virt.libvirt import rbd_utils
 from nova.virt.libvirt import utils as libvirt_utils
@@ -466,8 +464,6 @@ class LibvirtDriver(driver.ComputeDriver):
                   {'actual': CONF.libvirt.sysinfo_serial,
                    'expect': ', '.join("'%s'" % k for k in
                                        sysinfo_serial_funcs.keys())})
-
-        self.job_tracker = instancejobtracker.InstanceJobTracker()
 
     def _get_volume_drivers(self):
         return libvirt_volume_drivers
@@ -988,8 +984,6 @@ class LibvirtDriver(driver.ComputeDriver):
             connector["wwnns"] = self._fc_wwnns
             connector["wwpns"] = self._fc_wwpns
 
-        connector['platform'] = platform.machine()
-        connector['os_type'] = sys.platform
         return connector
 
     def _cleanup_resize(self, instance, network_info):
@@ -1333,23 +1327,10 @@ class LibvirtDriver(driver.ComputeDriver):
 
         snapshot = self._image_api.get(context, image_id)
 
-        # source_format is an on-disk format
-        # source_type is a backend type
-        disk_path, source_format = libvirt_utils.find_disk(virt_dom)
-        source_type = libvirt_utils.get_disk_type_from_path(disk_path)
+        disk_path = libvirt_utils.find_disk(virt_dom)
+        source_format = libvirt_utils.get_disk_type(disk_path)
 
-        # We won't have source_type for raw or qcow2 disks, because we can't
-        # determine that from the path. We should have it from the libvirt
-        # xml, though.
-        if source_type is None:
-            source_type = source_format
-        # For lxc instances we won't have it either from libvirt xml
-        # (because we just gave libvirt the mounted filesystem), or the path,
-        # so source_type is still going to be None. In this case,
-        # snapshot_backend is going to default to CONF.libvirt.images_type
-        # below, which is still safe.
-
-        image_format = CONF.libvirt.snapshot_image_format or source_type
+        image_format = CONF.libvirt.snapshot_image_format or source_format
 
         # NOTE(bfilippov): save lvm and rbd as raw
         if image_format == 'lvm' or image_format == 'rbd':
@@ -1375,7 +1356,7 @@ class LibvirtDriver(driver.ComputeDriver):
         if (self._host.has_min_version(MIN_LIBVIRT_LIVESNAPSHOT_VERSION,
                                        MIN_QEMU_LIVESNAPSHOT_VERSION,
                                        REQ_HYPERVISOR_LIVESNAPSHOT)
-             and source_type not in ('lvm', 'rbd')
+             and source_format not in ('lvm', 'rbd')
              and not CONF.ephemeral_storage_encryption.enabled
              and not CONF.workarounds.disable_libvirt_livesnapshot):
             live_snapshot = True
@@ -1410,7 +1391,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
         snapshot_backend = self.image_backend.snapshot(instance,
                 disk_path,
-                image_type=source_type)
+                image_type=source_format)
 
         if live_snapshot:
             LOG.info(_LI("Beginning live snapshot process"),
@@ -1429,8 +1410,7 @@ class LibvirtDriver(driver.ComputeDriver):
                     # NOTE(xqueralt): libvirt needs o+x in the temp directory
                     os.chmod(tmpdir, 0o701)
                     self._live_snapshot(context, instance, virt_dom, disk_path,
-                                        out_path, source_format, image_format,
-                                        base)
+                                        out_path, image_format, base)
                 else:
                     snapshot_backend.snapshot_extract(out_path, image_format)
             finally:
@@ -1540,7 +1520,7 @@ class LibvirtDriver(driver.ComputeDriver):
         self._set_quiesced(context, instance, image_meta, False)
 
     def _live_snapshot(self, context, instance, domain, disk_path, out_path,
-                       source_format, image_format, image_meta):
+                       image_format, image_meta):
         """Snapshot an instance without downtime."""
         # Save a copy of the domain's persistent XML file
         xml = domain.XMLDesc(
@@ -1558,11 +1538,9 @@ class LibvirtDriver(driver.ComputeDriver):
         #             in QEMU 1.3. In order to do this, we need to create
         #             a destination image with the original backing file
         #             and matching size of the instance root disk.
-        src_disk_size = libvirt_utils.get_disk_size(disk_path,
-                                                    format=source_format)
+        src_disk_size = libvirt_utils.get_disk_size(disk_path)
         src_back_path = libvirt_utils.get_disk_backing_file(disk_path,
-                                                        format=source_format,
-                                                        basename=False)
+                                                            basename=False)
         disk_delta = out_path + '.delta'
         libvirt_utils.create_cow_image(src_back_path, disk_delta,
                                        src_disk_size)
@@ -2418,6 +2396,129 @@ class LibvirtDriver(driver.ComputeDriver):
 
         timer = loopingcall.FixedIntervalLoopingCall(_wait_for_boot)
         timer.start(interval=0.5).wait()
+
+    def _live_resize_disk(self, flavor, delta):
+        """Live-resize of disk resources."""
+        # TODO(ahelkhou): will be implemented in a subsequent delivery.
+        raise exception.NovaException(
+            _("live-resize of root_disk not supported."))
+
+    def _live_resize_numa(self, flavor, delta):
+        """Live-resize of memory/vcpu resources for guests with NUMA."""
+        # TODO(ahelkhou): Need to add support live-resize of guests with NUMA.
+        raise exception.NovaException(
+            _("live-resize of guest with numa topology not supported yet"))
+
+    def _live_resize_non_numa(self, instance, flavor, delta):
+        """Live-resize of memory/vcpu resources for guests without NUMA."""
+        # Live-resize of memory in guests without NUMA utilizes baloon driver.
+        # Usage of balloon driver is not safe in cloud environment.
+        def set_vcpus_number(guest, vcpus):
+            """Change number of virtual CPUs.
+
+            :param vcpus: Number of vcpus to on-line in guest
+            """
+            flags = (libvirt.VIR_DOMAIN_AFFECT_LIVE |
+                     libvirt.VIR_DOMAIN_AFFECT_CONFIG)
+            guest.setVcpusFlags(vcpus, flags)
+
+        guest = self._host.get_domain(instance)
+        if delta['memory']:
+            raise exception.NovaException(
+                _("cannot live-resize memory for guests without NUMA"))
+        if delta['vcpus']:
+            set_vcpus_number(guest, flavor.vcpus)
+
+    def live_resize(self, context, image, instance, flavor):
+        """Live resize an instance to the specified flavor.
+
+        :param context: security context
+        :param nova.objects.instance.Instance instance:
+            The instance that will be live resized.
+        :param nova.objects.flavor.Flavor flavor:
+            The flavor to which the instance will be live resized to.
+
+        May raise exception if live-resize involve some resources for
+        which live-resize is not supported.
+        """
+        def get_metadata(guest):
+            """Retrieve guest metadata.
+
+            returns: guest metadata in xml format
+            """
+            flags = libvirt.VIR_DOMAIN_AFFECT_CONFIG
+            return guest.metadata(type=libvirt.VIR_DOMAIN_METADATA_ELEMENT,
+                                  uri=vconfig.NOVA_NS,
+                                  flags=flags)
+
+        def set_metadata(guest, metadata):
+            """Update guest metadata.
+
+            :param metadata: guest metadata in xml format
+            """
+            flags = (libvirt.VIR_DOMAIN_AFFECT_CONFIG |
+                     libvirt.VIR_DOMAIN_AFFECT_LIVE)
+            guest.setMetadata(
+                type=libvirt.VIR_DOMAIN_METADATA_ELEMENT,
+                metadata=metadata,
+                key="nova",
+                uri=vconfig.NOVA_NS,
+                flags=flags)
+
+        def live_resize_update_instance_metadata(guest, flavor):
+            xmlstr = get_metadata(guest)
+            meta = vconfig.LibvirtConfigGuestMetaNovaInstance()
+            meta.parse_str(xmlstr)
+            meta.flavor.name = flavor.name
+            meta.flavor.memory = flavor.memory_mb
+            meta.flavor.vcpus = flavor.vcpus
+            meta.flavor.ephemeral = flavor.ephemeral_gb
+            meta.flavor.disk = flavor.root_gb
+            meta.flavor.swap = flavor.swap
+            set_metadata(guest, meta.to_xml())
+
+        # Get the system metadata from the instance
+        image_meta = utils.get_image_from_system_metadata(
+            instance.system_metadata)
+        if not image_meta:
+            image_ref = instance.get('image_ref')
+            image_meta = compute_utils.get_image_metadata(context,
+                                                    self._image_api,
+                                                    image_ref,
+                                                    instance)
+
+        old_flavor = objects.Flavor.get_by_id(context,
+                                              instance['instance_type_id'])
+        try:
+            guest = self._host.get_domain(instance)
+        except exception.InstanceNotFound:
+            raise exception.InstanceNotRunning(instance_id=instance.uuid)
+
+        delta = hardware.get_live_resize_resource_delta(old_flavor,
+                                                        flavor, image_meta)
+        try:
+            if delta.get('vcpus') or delta.get('memory'):
+                self._live_resize_non_numa(instance, flavor, delta)
+            if delta.get("disk"):
+                self._live_resize_disk(flavor, delta)
+        except Exception as e:
+            # TODO(ahelkhou): Need to try revert resized resources when
+            # we try to resize multiple resources at the same time.
+            with excutils.save_and_reraise_exception():
+                LOG.error(_LE("Live-Resize failure: %s"), e,
+                          instance=instance)
+
+        if delta['changes']:
+            pass
+#            live_resize_update_instance_metadata(guest, flavor)
+        else:
+            raise exception.NovaException(
+                _("live-resise of %(instance)s did not find any "
+                  "resource changes between source flavor %(src)s "
+                  "and target flavor %(target)s") %
+                {'instance': instance.name,
+                 'src': old_flavor.name,
+                 'target': flavor.name})
 
     def _flush_libvirt_console(self, pty):
         out, err = utils.execute('dd',
@@ -4021,6 +4122,12 @@ class LibvirtDriver(driver.ComputeDriver):
         guest.cputune = guest_numa_config.cputune
         guest.numatune = guest_numa_config.numatune
 
+        limits = hardware.get_live_resize_constraints(flavor, image_meta)
+        guest.max_vcpus = limits['max_vcpus'] or guest.vcpus
+        if guest.numatune:
+            guest.max_memory = limits['max_memory']
+            guest.max_memory_slots = limits['max_memory_slots']
+
         guest.membacking = self._get_guest_memory_backing_config(
             instance.numa_topology, guest_numa_config.numatune)
 
@@ -4496,7 +4603,6 @@ class LibvirtDriver(driver.ComputeDriver):
         """
         if self._vcpu_total != 0:
             return self._vcpu_total
-
         try:
             total_pcpus = self._conn.getInfo()[2]
         except libvirt.libvirtError:
@@ -5206,8 +5312,7 @@ class LibvirtDriver(driver.ComputeDriver):
         else:
             cpu = self._vcpu_model_to_cpu_config(guest_cpu)
 
-        u = ("http://libvirt.org/html/libvirt-libvirt-host.html#"
-             "virCPUCompareResult")
+        u = "http://libvirt.org/html/libvirt-libvirt.html#virCPUCompareResult"
         m = _("CPU doesn't have compatibility.\n\n%(ret)s\n\nRefer to %(u)s")
         # unknown character exists in xml, then libvirt complains
         try:
@@ -5826,24 +5931,6 @@ class LibvirtDriver(driver.ComputeDriver):
                 raise exception.DestinationDiskExists(path=instance_dir)
             os.mkdir(instance_dir)
 
-            # Recreate the disk.info file and in doing so stop the
-            # imagebackend from recreating it incorrectly by inspecting the
-            # contents of each file when using the Raw backend.
-            if disk_info:
-                image_disk_info = {}
-                for info in jsonutils.loads(disk_info):
-                    image_file = os.path.basename(info['path'])
-                    image_path = os.path.join(instance_dir, image_file)
-                    image_disk_info[image_path] = info['type']
-
-                LOG.debug('Creating disk.info with the contents: %s',
-                          image_disk_info, instance=instance)
-
-                image_disk_info_path = os.path.join(instance_dir,
-                                                    'disk.info')
-                libvirt_utils.write_to_file(image_disk_info_path,
-                                            jsonutils.dumps(image_disk_info))
-
             if not is_shared_block_storage:
                 # Ensure images and backing files are present.
                 self._create_images_and_backing(
@@ -6018,24 +6105,8 @@ class LibvirtDriver(driver.ComputeDriver):
         # Disconnect from volume server
         block_device_mapping = driver.block_device_info_get_mapping(
                 block_device_info)
-        connector = self.get_volume_connector(instance)
-        volume_api = self._volume_api
         for vol in block_device_mapping:
-            # Retrieve connection info from Cinder's initialize_connection API.
-            # The info returned will be accurate for the source server.
-            volume_id = vol['connection_info']['serial']
-            connection_info = volume_api.initialize_connection(context,
-                                                               volume_id,
-                                                               connector)
-
-            # Pull out multipath_id from the bdm information. The
-            # multipath_id can be placed into the connection info
-            # because it is based off of the volume and will be the
-            # same on the source and destination hosts.
-            if 'multipath_id' in vol['connection_info']['data']:
-                multipath_id = vol['connection_info']['data']['multipath_id']
-                connection_info['data']['multipath_id'] = multipath_id
-
+            connection_info = vol['connection_info']
             disk_dev = vol['mount_device'].rpartition("/")[2]
             self._disconnect_volume(connection_info, disk_dev)
 
@@ -6339,11 +6410,6 @@ class LibvirtDriver(driver.ComputeDriver):
                 dest = None
                 utils.execute('mkdir', '-p', inst_base)
 
-            on_execute = lambda process: \
-                self.job_tracker.add_job(instance, process.pid)
-            on_completion = lambda process: \
-                self.job_tracker.remove_job(instance, process.pid)
-
             active_flavor = instance.get_flavor()
             for info in disk_info:
                 # assume inst_base == dirname(info['path'])
@@ -6372,25 +6438,11 @@ class LibvirtDriver(driver.ComputeDriver):
                     if shared_storage:
                         utils.execute('mv', tmp_path, img_path)
                     else:
-                        libvirt_utils.copy_image(tmp_path, img_path, host=dest,
-                                                 on_execute=on_execute,
-                                                 on_completion=on_completion)
+                        libvirt_utils.copy_image(tmp_path, img_path, host=dest)
                         utils.execute('rm', '-f', tmp_path)
 
                 else:  # raw or qcow2 with no backing file
-                    libvirt_utils.copy_image(from_path, img_path, host=dest,
-                                             on_execute=on_execute,
-                                             on_completion=on_completion)
-
-            # Ensure disk.info is written to the new path to avoid disks being
-            # reinspected and potentially changing format.
-            src_disk_info_path = os.path.join(inst_base_resize, 'disk.info')
-            if os.path.exists(src_disk_info_path):
-                dst_disk_info_path = os.path.join(inst_base, 'disk.info')
-                libvirt_utils.copy_image(src_disk_info_path,
-                                         dst_disk_info_path,
-                                         host=dest, on_execute=on_execute,
-                                         on_completion=on_completion)
+                    libvirt_utils.copy_image(from_path, img_path, host=dest)
         except Exception:
             with excutils.save_and_reraise_exception():
                 self._cleanup_remote_migration(dest, inst_base,
@@ -6759,8 +6811,6 @@ class LibvirtDriver(driver.ComputeDriver):
         # invocation failed due to the absence of both target and
         # target_resize.
         if not remaining_path and os.path.exists(target_del):
-            self.job_tracker.terminate_jobs(instance)
-
             LOG.info(_LI('Deleting instance files %s'), target_del,
                      instance=instance)
             remaining_path = target_del

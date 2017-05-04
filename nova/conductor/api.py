@@ -219,6 +219,14 @@ class LocalComputeTaskAPI(object):
             context, instance, scheduler_hint, True, False, None,
             block_migration, disk_over_commit, None)
 
+    def live_resize_instance(self, context, instance, flavor, reservations,
+                             scheduler_hint):
+        self._manager.live_resize_instance(
+            context,
+            instance=instance, flavor=flavor,
+            reservations=reservations,
+            scheduler_hint=scheduler_hint)
+
     def build_instances(self, context, instances, image,
             filter_properties, admin_password, injected_files,
             requested_networks, security_groups, block_device_mapping,
@@ -331,6 +339,13 @@ class ComputeTaskAPI(object):
         self.conductor_compute_rpcapi.migrate_server(
             context, instance, scheduler_hint, True, False, None,
             block_migration, disk_over_commit, None)
+
+    def live_resize_instance(self, context, instance, flavor, reservations,
+                             scheduler_hint):
+        self.conductor_compute_rpcapi.live_resize_instance(context,
+                instance=instance, flavor=flavor,
+                reservations=reservations,
+                scheduler_hint=scheduler_hint)
 
     def build_instances(self, context, instances, image, filter_properties,
             admin_password, injected_files, requested_networks,

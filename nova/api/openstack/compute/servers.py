@@ -821,6 +821,29 @@ class Controller(wsgi.Controller):
 
         return webob.Response(status_int=202)
 
+    def _live_resize(self, req, instance_id, flavor_id, **kwargs):
+        """Begin the live resize process with given instance/flavor."""
+        context = req.environ["nova.context"]
+        instance = self._get_server(context, req, instance_id)
+        try:
+            self.compute_api.live_resize(context, instance, flavor_id, **kwargs)
+        except exception.QuotaError as error:
+            raise exc.HTTPForbidden(
+                explanation=error.format_message(),
+                headers={'Retry-Afer': 0})
+        except exception.FlavorNotFound:
+            msg = _("Unable to locate requested flavor.")
+            raise exc.HTTPBadRequest(explanation=msg)
+        except exception.CannotResizeToSameFlavor:
+            msg = _("Resize requires a flavor change.")
+            raise exc.HTTPBadRequest(explanation=msg)
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
+        except exception.InstanceInvalidState as state_error:
+            common.raise_http_conflict_for_instance_invalid_state(
+                state_error, 'live-resize', instance_id)
+             
+
     @wsgi.response(204)
     def delete(self, req, id):
         """Destroys a server."""
@@ -940,6 +963,24 @@ class Controller(wsgi.Controller):
             kwargs['auto_disk_config'] = body['resize']['auto_disk_config']
 
         return self._resize(req, id, flavor_ref, **kwargs)
+
+
+    @wsgi.response(202)
+    @wsgi.action('live-resize')
+    def _action_live_resize(self, req, id, body):
+        """Live resizes a given instance to the flavor size requested."""
+        try:
+            flavor_ref = str(body["live-resize"]["flavorRef"])
+            if not flavor_ref:
+                msg = _("Resize request has invalid 'flavorRef' attribute.")
+                raise exc.HTTPBadRequest(explanation=msg)
+        except (KeyError, TypeError):
+            msg = _("Resize requests require 'flavorRef' attribute.")
+            raise exc.HTTPBadRequest(explanation=msg)
+
+        kwargs = {}
+
+        return self._live_resize(req, id, flavor_ref, **kwargs)
 
     @wsgi.response(202)
     @wsgi.action('rebuild')

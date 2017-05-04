@@ -294,6 +294,7 @@ class ComputeAPI(object):
         can handle the version_cap being set to 3.40
 
         * 4.0  - Remove 3.x compatibility
+        * 4.1  - Added live resize_instance
     '''
 
     VERSION_ALIASES = {
@@ -740,6 +741,19 @@ class ComputeAPI(object):
         cctxt = self.client.prepare(server=_compute_host(None, instance),
                 version=version)
         cctxt.cast(ctxt, 'reset_network', instance=instance)
+
+    def live_resize_instance(self, ctxt, image, instance, instance_type,
+                             reservations):
+        msg_args = {'instance': instance,
+                    'instance_type': instance_type,
+                    'image': image,
+                    'reservations': reservations}
+        version = '4.0'
+        # raise exception if not self.client.can_send_version(version)?
+
+        cctxt = self.client.prepare(server=_compute_host(None, instance),
+                                    version=version)
+        cctxt.cast(ctxt, 'live_resize_instance', **msg_args)
 
     def resize_instance(self, ctxt, instance, migration, image, instance_type,
                         reservations=None, clean_shutdown=True):

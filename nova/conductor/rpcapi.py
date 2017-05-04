@@ -396,6 +396,16 @@ class ComputeTaskAPI(object):
         cctxt = self.client.prepare(version=version)
         return cctxt.call(context, 'migrate_server', **kw)
 
+    def live_resize_instance(self, context, instance, flavor, reservations,
+                             scheduler_hint):
+        kw = {'instance': instance, 'flavor': flavor,
+              'reservations': reservations,
+              'scheduler_hint': scheduler_hint}
+        version = '1.12'
+
+        cctxt = self.client.prepare(version=version)
+        return cctxt.call(context, 'live_resize_instance', **kw)
+
     def build_instances(self, context, instances, image, filter_properties,
             admin_password, injected_files, requested_networks,
             security_groups, block_device_mapping, legacy_bdm=True):

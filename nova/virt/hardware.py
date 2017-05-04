@@ -567,7 +567,12 @@ def _get_desirable_cpu_topologies(flavor, image_meta, allow_threads=True,
                                             min_requested_threads)
             specified_threads = max(1, min_requested_threads)
 
-    possible = _get_possible_cpu_topologies(flavor.vcpus,
+    limits = get_live_resize_constraints(flavor, image_meta)
+    max_vcpus = limits['max_vcpus'] or flavor.vcpus
+    LOG.debug(" flavor vcpus %(vcpus)s, maximum vcpus %(maximum)s",
+              {"vcpus": flavor.vcpus, "maximum": limits['max_vcpus']})
+
+    possible = _get_possible_cpu_topologies(max_vcpus,
                                             maximum,
                                             allow_threads,
                                             specified_threads)
@@ -896,6 +901,49 @@ def _numa_get_constraints_manual(nodes, flavor, image_meta):
             memtotal=flavor['memory_mb'])
 
     return objects.InstanceNUMATopology(cells=cells)
+
+
+def get_live_resize_constraints(flavor, image_meta):
+    """Return live-resize constraints from flavor and image metadata.
+
+    :param flavor: Flavor object to read extra specs from
+    :param image_meta: nova.objects.ImageMeta object instance
+
+    returns live-resize limits or none.
+    """
+    limits = dict()
+    specs = flavor.get('extra_specs', {})
+
+    limits['max_vcpus'] = int(specs.get('hw:max_vcpus', 0))
+    limits['max_memory'] = int(specs.get('hw:max_memory', 0)) * units.Ki
+    limits['max_memory_slots'] = int(specs.get('hw:max_memory_slots', 16))
+
+    return limits
+
+
+def get_live_resize_resource_delta(flavor, new_flavor, image_meta):
+    """Calculate deltas of changed resources between flavor and target flavors.
+
+    This function currently works with non NUMA guests.
+    :param flavor: current Flavor object
+    :param flavor: target  Flavor object
+    :param image_meta: nova.objects.ImageMeta object instance
+
+    returns delta dictionary.
+    """
+    delta = dict()
+    numa_topo = numa_get_constraints(flavor, image_meta)
+    new_numa_topo = numa_get_constraints(new_flavor, image_meta)
+    if numa_topo or new_numa_topo:
+        raise exception.NovaException(
+            _("cannot live-resize with numa topologies defined"))
+
+    delta['vcpus'] = new_flavor.vcpus - flavor.vcpus
+    delta['memory'] = new_flavor.memory_mb - flavor.memory_mb
+    delta['disk'] = new_flavor.root_gb - flavor.root_gb
+    delta["changes"] = delta['vcpus'] or delta['memory'] or delta['disk']
+
+    return delta
 
 
 def _numa_get_constraints_auto(nodes, flavor, image_meta):

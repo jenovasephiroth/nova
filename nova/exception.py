@@ -46,7 +46,7 @@ CONF.register_opts(exc_log_opts)
 
 
 class ConvertedException(webob.exc.WSGIHTTPException):
-    def __init__(self, code=500, title="", explanation=""):
+    def __init__(self, code=0, title="", explanation=""):
         self.code = code
         self.title = title
         self.explanation = explanation
@@ -1227,6 +1227,12 @@ class PasteAppNotFound(NovaException):
 
 class CannotResizeToSameFlavor(NovaException):
     msg_fmt = _("When resizing, instances must change flavor!")
+
+
+class CannotLiveResizeToSmallerFlavor(NovaException):
+    msg_fmt = _("When live resizing, given flavor must be larger than the "
+                "current instance flavor. Instance flavor: "
+                "%(old_instance_type)s, given flavor: %(new_instance_type)s")
 
 
 class ResizeError(NovaException):
